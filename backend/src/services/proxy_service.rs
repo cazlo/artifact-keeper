@@ -1337,6 +1337,27 @@ impl UpstreamClient {
         }
     }
 
+    /// Resolve the effective upstream auth for a request to `repo_id` targeting
+    /// `request_url`.
+    ///
+    /// This is the single entry point the proxy fetch paths use in place of the
+    /// static [`crate::services::upstream_auth::load_upstream_auth`]. It returns
+    /// the same `UpstreamAuthType`, so `apply_upstream_auth` and the
+    /// bearer-forward match in [`Self::obtain_bearer_token`] consume it
+    /// unchanged.
+    ///
+    /// Today it resolves static Basic/Bearer. The `aws_ecr` dynamic-provider arm
+    /// is layered on top of this seam: it needs `request_url` for ECR
+    /// host-shape validation, which is why the URL is threaded through here even
+    /// though the static path ignores it.
+    pub(crate) async fn resolve_upstream_auth(
+        &self,
+        repo_id: Uuid,
+        _request_url: &str,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await
+    }
+
     /// Buffered upstream fetch. Relocated verbatim from
     /// `ProxyService::fetch_from_upstream_with_accept`.
     ///
@@ -1362,8 +1383,7 @@ impl UpstreamClient {
             accept
         );
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self.resolve_upstream_auth(repo_id, url).await?;
 
         let mut request = self.http_client.get(url);
         if let Some(ref auth) = upstream_auth {
@@ -1490,8 +1510,7 @@ impl UpstreamClient {
     async fn fetch_stream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamStream> {
         tracing::info!("Fetching artifact from upstream (streaming): {}", url);
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self.resolve_upstream_auth(repo_id, url).await?;
 
         let mut request = self.http_client.get(url);
         if let Some(ref auth) = upstream_auth {
@@ -1794,8 +1813,7 @@ impl UpstreamClient {
         cached_etag: &str,
         repo_id: Uuid,
     ) -> Result<bool> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self.resolve_upstream_auth(repo_id, url).await?;
 
         let mut request = self
             .http_client
@@ -3677,6 +3695,24 @@ impl ProxyService {
         repo_id: Uuid,
     ) -> Result<UpstreamStream> {
         self.upstream_client.fetch_stream(url, repo_id).await
+    }
+
+    /// Resolve the effective upstream auth for a request to `repo_id` targeting
+    /// `request_url`, including dynamic providers (e.g. `aws_ecr`).
+    ///
+    /// Thin public delegate to [`UpstreamClient::resolve_upstream_auth`] so
+    /// non-proxy callers that hold an `Arc<ProxyService>` — notably the
+    /// `test_upstream` handler via `AppState.proxy_service` — can resolve
+    /// dynamic upstream auth without reaching into the private `UpstreamClient`
+    /// or its ECR token cache.
+    pub async fn resolve_upstream_auth(
+        &self,
+        repo_id: Uuid,
+        request_url: &str,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        self.upstream_client
+            .resolve_upstream_auth(repo_id, request_url)
+            .await
     }
 
     /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`

@@ -44,12 +44,51 @@ impl std::fmt::Debug for UpstreamAuthType {
     }
 }
 
-/// Load upstream auth credentials for a repository.
-/// Returns None if no auth is configured.
+/// Load **static** upstream auth credentials (Basic/Bearer) for a repository.
+/// Returns `None` if no auth is configured.
+///
+/// This is the static-only path. Dynamic provider types (e.g. `aws_ecr`) store
+/// provider *config* — not on-wire secrets — under the same encrypted key and
+/// are resolved by [`crate::services::proxy_service`]'s
+/// `UpstreamClient::resolve_upstream_auth`, never here. For such a row this
+/// returns `Ok(None)` **by documented design** so static-only callers (the
+/// scheduler curation sync) degrade to "no static auth" rather than erroring on
+/// an unrecognized type. Callers that must honor dynamic auth (the proxy fetch
+/// paths, `test_upstream`) go through the resolver instead.
 pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<UpstreamAuthType>> {
-    // Load auth type
-    let auth_type: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'upstream_auth_type'",
+    let auth_type = match get_upstream_auth_type(db, repo_id).await? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    // See the doc comment: dynamic provider types are resolved elsewhere.
+    if !is_static_auth_type(&auth_type) {
+        return Ok(None);
+    }
+
+    let credentials_json = load_credentials_json(db, repo_id).await?.ok_or_else(|| {
+        AppError::Config("Upstream auth type is configured but credentials are missing".to_string())
+    })?;
+
+    parse_credentials_json(&auth_type, &credentials_json).map(Some)
+}
+
+/// Whether `auth_type` is a static on-wire credential type that
+/// [`load_upstream_auth`] resolves directly. Dynamic provider types such as
+/// `aws_ecr` are intentionally excluded: they resolve through the
+/// `UpstreamClient` resolver, which mints/caches an effective credential.
+pub(crate) fn is_static_auth_type(auth_type: &str) -> bool {
+    matches!(auth_type, "basic" | "bearer")
+}
+
+/// Read and decrypt the stored `upstream_auth_credentials` JSON for a repo.
+/// Returns `None` when no credentials row exists. The decrypted JSON is the
+/// provider-specific shape: static Basic/Bearer secrets, or `aws_ecr` provider
+/// config (region/registry_id). Shared by the static loader and the dynamic
+/// ECR config loader so the read+decrypt lives in exactly one place.
+pub(crate) async fn load_credentials_json(db: &PgPool, repo_id: Uuid) -> Result<Option<String>> {
+    let encrypted_hex: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'upstream_auth_credentials'",
     )
     .bind(repo_id)
     .fetch_optional(db)
@@ -57,29 +96,10 @@ pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<Ups
     .map_err(|e| AppError::Database(e.to_string()))?
     .flatten();
 
-    let auth_type = match filter_auth_type(auth_type) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-
-    // Load and decrypt credentials
-    let encrypted_hex: String = sqlx::query_scalar(
-        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'upstream_auth_credentials'",
-    )
-    .bind(repo_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .flatten()
-    .ok_or_else(|| {
-        AppError::Config(
-            "Upstream auth type is configured but credentials are missing".to_string(),
-        )
-    })?;
-
-    let credentials_json = decrypt_credentials_hex(&encrypted_hex, &encryption_key())?;
-
-    parse_credentials_json(&auth_type, &credentials_json).map(Some)
+    match encrypted_hex {
+        Some(hex) => Ok(Some(decrypt_credentials_hex(&hex, &encryption_key())?)),
+        None => Ok(None),
+    }
 }
 
 /// Parse auth credentials from a JSON value given an auth type string.
@@ -399,6 +419,22 @@ mod tests {
     #[test]
     fn test_filter_auth_type_none_value() {
         assert_eq!(filter_auth_type(None), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_static_auth_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_static_auth_type() {
+        assert!(is_static_auth_type("basic"));
+        assert!(is_static_auth_type("bearer"));
+        // Dynamic provider types are NOT static and must be resolved elsewhere.
+        assert!(!is_static_auth_type("aws_ecr"));
+        // Unknown / sentinel values are not static either.
+        assert!(!is_static_auth_type("none"));
+        assert!(!is_static_auth_type(""));
+        assert!(!is_static_auth_type("oauth2"));
     }
 
     // -----------------------------------------------------------------------

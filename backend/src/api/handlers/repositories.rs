@@ -5041,10 +5041,29 @@ pub async fn test_upstream(
 
     let mut request = client.head(upstream_url);
 
-    // Apply upstream auth if configured
-    if let Some(upstream_auth) =
-        crate::services::upstream_auth::load_upstream_auth(&state.db, repo.id).await?
-    {
+    // Resolve upstream auth, including dynamic providers (e.g. aws_ecr).
+    // Dynamic resolution (ECR token minting + host-shape validation) lives on
+    // the proxy's `UpstreamClient`, so route through `proxy_service` when it is
+    // present. Without a proxy service only static Basic/Bearer can be
+    // resolved; a dynamic type then fails clearly instead of HEADing the
+    // upstream unauthenticated.
+    let upstream_auth = match state.proxy_service.as_ref() {
+        Some(proxy) => proxy.resolve_upstream_auth(repo.id, upstream_url).await?,
+        None => {
+            let auth_type =
+                crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
+            if matches!(auth_type.as_deref(), Some(t) if !crate::services::upstream_auth::is_static_auth_type(t))
+            {
+                return Err(AppError::Validation(
+                    "Cannot test upstream: a dynamic upstream auth provider is configured but \
+                     the proxy service is not enabled in this deployment"
+                        .to_string(),
+                ));
+            }
+            crate::services::upstream_auth::load_upstream_auth(&state.db, repo.id).await?
+        }
+    };
+    if let Some(upstream_auth) = upstream_auth {
         request = crate::services::upstream_auth::apply_upstream_auth(request, &upstream_auth);
     }
 
