@@ -12,10 +12,36 @@ use crate::services::auth_config_service::encryption_key;
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
 
 /// Auth types supported for upstream repositories.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is hand-written (NOT derived) so the secret material — the Basic
+/// `password` and the Bearer `token` — is never printed. The dynamic ECR
+/// resolver returns `Basic { username: "AWS", password: <AWS-vended token> }`,
+/// so a derived `Debug` would risk leaking a live registry token into logs or
+/// error chains; the redacting impl below keeps the variant + non-secret
+/// `username` for debuggability while masking the credential. See
+/// `test_upstream_auth_type_debug_redacts_*`.
+#[derive(Clone, PartialEq)]
 pub enum UpstreamAuthType {
     Basic { username: String, password: String },
     Bearer { token: String },
+}
+
+impl std::fmt::Debug for UpstreamAuthType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Keep the non-secret `username` (e.g. "AWS" for ECR) for
+            // debugging; mask the password.
+            UpstreamAuthType::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            UpstreamAuthType::Bearer { .. } => f
+                .debug_struct("Bearer")
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// Load upstream auth credentials for a repository.
@@ -439,13 +465,38 @@ mod tests {
     }
 
     #[test]
-    fn test_upstream_auth_type_debug() {
+    fn test_upstream_auth_type_debug_redacts_token() {
+        // The Bearer token is secret material (and, for ECR, an AWS-vended
+        // registry token). It must NEVER appear in Debug output. Use a
+        // distinctive value that does not collide with the "token" field
+        // name so the negative assertion is meaningful.
         let auth = UpstreamAuthType::Bearer {
-            token: "tok".to_string(),
+            token: "s3cr3t-bearer-value-xyz".to_string(),
         };
         let debug = format!("{:?}", auth);
         assert!(debug.contains("Bearer"));
-        assert!(debug.contains("tok"));
+        assert!(
+            !debug.contains("s3cr3t-bearer-value-xyz"),
+            "token must not appear in Debug output: {debug}"
+        );
+        assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn test_upstream_auth_type_debug_redacts_basic_password() {
+        let auth = UpstreamAuthType::Basic {
+            username: "AWS".to_string(),
+            password: "s3cr3t-basic-pw-xyz".to_string(),
+        };
+        let debug = format!("{:?}", auth);
+        assert!(debug.contains("Basic"));
+        // username is not secret; keep it for debuggability.
+        assert!(debug.contains("AWS"));
+        assert!(
+            !debug.contains("s3cr3t-basic-pw-xyz"),
+            "password must not appear in Debug output: {debug}"
+        );
+        assert!(debug.contains("redacted"));
     }
 
     #[test]
