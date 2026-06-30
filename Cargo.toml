@@ -51,6 +51,14 @@ zeroize = { version = "1.8", features = ["alloc", "derive"] }
 # S3 storage using Apache object_store crate (supports custom CA certs for TLS)
 object_store = { version = "0.13", features = ["aws"] }
 
+# AWS SDK for dynamic managed-registry upstream auth (issue #1559). First AWS
+# SDK crates in the tree. Used to mint short-lived ECR registry credentials via
+# the AWS default credential chain (IRSA / EKS Pod Identity / instance roles);
+# no AWS keys are stored in repository config. `behavior-version-latest` pins
+# the SDK behavior major so a transitive bump cannot silently change defaults.
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-ecr = "1"
+
 # HTTP types (used for presigned URL methods)
 http = "1"
 http-body-util = "0.1"

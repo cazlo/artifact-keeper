@@ -13,6 +13,7 @@ pub mod build_service;
 pub mod cache_classifier;
 pub mod declared_dependencies;
 pub mod dependency_track_service;
+pub mod ecr_auth;
 pub mod email_dispatcher;
 pub mod email_rate_limiter;
 pub mod encryption;

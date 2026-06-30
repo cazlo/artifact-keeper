@@ -49,6 +49,10 @@ zeroize.workspace = true
 # S3 storage using Apache object_store crate
 object_store.workspace = true
 
+# AWS SDK (dynamic ECR upstream auth, issue #1559)
+aws-config.workspace = true
+aws-sdk-ecr.workspace = true
+
 # HTTP types (presigned URL methods)
 http.workspace = true
 http-body-util.workspace = true
