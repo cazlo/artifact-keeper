@@ -1320,6 +1320,14 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
+
+    // `aws_ecr` upstream auth needs region/registry_id config that
+    // CreateRepositoryRequest does not carry in this first PR. Reject it here —
+    // before the repository is created, so no partial repo is left behind —
+    // rather than silently accepting a type it cannot fully configure. Configure
+    // ECR via PUT /repositories/{key}/upstream-auth after creation.
+    reject_create_time_ecr(payload.upstream_auth_type.as_deref())?;
+
     // Resolve the format string via the service. The service owns both the
     // built-in enum mapping and the `format_handlers` fallback for WASM
     // plugin formats, so the handler keeps no business logic of its own here.
@@ -1439,7 +1447,8 @@ pub async fn create_repository(
         }
     }
 
-    // Store upstream auth credentials if provided
+    // Store upstream auth credentials if provided. `aws_ecr` is rejected up
+    // front (before the repo is created), so only static types reach here.
     if let Some(ref auth_type) = payload.upstream_auth_type {
         let credentials_json = build_upstream_credentials(
             auth_type,
@@ -4919,12 +4928,23 @@ pub async fn update_virtual_members(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpstreamAuthRequest {
-    /// Auth type: "basic", "bearer", or "none" to remove.
+    /// Auth type: "basic", "bearer", "aws_ecr", or "none" to remove.
     pub auth_type: String,
     /// Username for basic auth.
     pub username: Option<String>,
     /// Password (basic) or token (bearer). Write-only, never returned.
     pub password: Option<String>,
+    /// AWS region for `aws_ecr` (e.g. "us-west-2"). Required for `aws_ecr`.
+    pub region: Option<String>,
+    /// Optional 12-digit AWS account id for `aws_ecr`. Config/safety metadata
+    /// only (cache key + host validation); never sent to `GetAuthorizationToken`.
+    pub registry_id: Option<String>,
+    /// Per-repo assume-role ARN for `aws_ecr`. Not yet supported; rejected if
+    /// set rather than silently ignored (so an operator can't believe a role is
+    /// assumed when it is not).
+    pub role_arn: Option<String>,
+    /// External id for the assume-role flow. Not yet supported; rejected if set.
+    pub external_id: Option<String>,
 }
 
 /// Load a remote repository by key, verifying auth and repo type.
@@ -4982,11 +5002,23 @@ pub async fn set_upstream_auth(
         ));
     }
 
-    let credentials_json = build_upstream_credentials(
-        &payload.auth_type,
-        payload.username.as_deref(),
-        payload.password.as_deref(),
-    )?;
+    // `aws_ecr` stores non-secret provider config (region/registry_id); static
+    // types store Basic/Bearer secrets. Both go through the same encrypted
+    // `upstream_auth_credentials` row, just with a different JSON shape.
+    let credentials_json = if payload.auth_type == "aws_ecr" {
+        build_ecr_upstream_config(
+            payload.region.as_deref(),
+            payload.registry_id.as_deref(),
+            payload.role_arn.as_deref(),
+            payload.external_id.as_deref(),
+        )?
+    } else {
+        build_upstream_credentials(
+            &payload.auth_type,
+            payload.username.as_deref(),
+            payload.password.as_deref(),
+        )?
+    };
 
     crate::services::upstream_auth::save_upstream_auth(
         &state.db,
@@ -5387,6 +5419,61 @@ fn build_upstream_credentials(
     };
 
     Ok(build_credentials_json(&auth))
+}
+
+/// Build the encrypted-config JSON for an `aws_ecr` upstream from request
+/// fields. `region` is required; `role_arn`/`external_id` are deferred and are
+/// rejected (not silently ignored) so an operator cannot believe a role is
+/// assumed when it is not. Returns no secrets — only non-secret provider config.
+fn build_ecr_upstream_config(
+    region: Option<&str>,
+    registry_id: Option<&str>,
+    role_arn: Option<&str>,
+    external_id: Option<&str>,
+) -> crate::error::Result<String> {
+    reject_unsupported_ecr_field(role_arn, "role_arn")?;
+    reject_unsupported_ecr_field(external_id, "external_id")?;
+
+    let region = region
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::Validation("region is required for aws_ecr auth".to_string()))?;
+
+    let cfg = crate::services::ecr_auth::AwsEcrConfig {
+        region: region.to_string(),
+        registry_id: registry_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
+    Ok(crate::services::ecr_auth::build_aws_ecr_config_json(&cfg))
+}
+
+/// Reject an `aws_ecr` field that is configured but not yet supported, with a
+/// clear "not yet supported" validation error. A `None` / empty value is
+/// treated as unset and accepted.
+fn reject_unsupported_ecr_field(value: Option<&str>, field: &str) -> crate::error::Result<()> {
+    if value.map(str::trim).is_some_and(|s| !s.is_empty()) {
+        return Err(AppError::Validation(format!(
+            "{field} is not yet supported for aws_ecr upstream auth"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject `aws_ecr` at repository-creation time: it needs region/registry_id
+/// config that `CreateRepositoryRequest` does not carry in this first PR, so it
+/// must be configured via `PUT /upstream-auth` after creation. All other (or
+/// absent) auth types are accepted.
+fn reject_create_time_ecr(upstream_auth_type: Option<&str>) -> crate::error::Result<()> {
+    if upstream_auth_type == Some("aws_ecr") {
+        return Err(AppError::Validation(
+            "aws_ecr upstream auth cannot be configured at repository creation; \
+             create the repository, then call PUT /repositories/{key}/upstream-auth"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Convert a VirtualMemberRow into a VirtualMemberResponse.
@@ -9794,6 +9881,93 @@ mod tests {
     #[test]
     fn test_build_upstream_credentials_invalid_type() {
         assert_credentials_err("oauth2", Some("u"), Some("p"), "Invalid auth_type");
+    }
+
+    // -----------------------------------------------------------------------
+    // aws_ecr request parsing + build_ecr_upstream_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upstream_auth_request_aws_ecr() {
+        let json = r#"{"auth_type":"aws_ecr","region":"us-west-2","registry_id":"123456789012"}"#;
+        let req: UpstreamAuthRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.auth_type, "aws_ecr");
+        assert_eq!(req.region, Some("us-west-2".to_string()));
+        assert_eq!(req.registry_id, Some("123456789012".to_string()));
+        assert!(req.role_arn.is_none());
+        assert!(req.external_id.is_none());
+    }
+
+    #[test]
+    fn test_build_ecr_upstream_config_ok() {
+        let json =
+            build_ecr_upstream_config(Some("us-west-2"), Some("123456789012"), None, None).unwrap();
+        // Round-trips through the provider config parser to the same values.
+        let cfg = crate::services::ecr_auth::parse_aws_ecr_config(&json).unwrap();
+        assert_eq!(cfg.region, "us-west-2");
+        assert_eq!(cfg.registry_id.as_deref(), Some("123456789012"));
+    }
+
+    #[test]
+    fn test_build_ecr_upstream_config_region_only() {
+        let json = build_ecr_upstream_config(Some("eu-west-1"), None, None, None).unwrap();
+        let cfg = crate::services::ecr_auth::parse_aws_ecr_config(&json).unwrap();
+        assert_eq!(cfg.region, "eu-west-1");
+        assert_eq!(cfg.registry_id, None);
+    }
+
+    #[test]
+    fn test_build_ecr_upstream_config_missing_region_errors() {
+        let err = build_ecr_upstream_config(None, Some("123456789012"), None, None).unwrap_err();
+        assert!(err.to_string().contains("region is required"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_ecr_upstream_config_rejects_role_arn() {
+        let err = build_ecr_upstream_config(
+            Some("us-west-2"),
+            None,
+            Some("arn:aws:iam::123456789012:role/pull"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("role_arn is not yet supported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_ecr_upstream_config_rejects_external_id() {
+        let err =
+            build_ecr_upstream_config(Some("us-west-2"), None, None, Some("ext-123")).unwrap_err();
+        assert!(
+            err.to_string().contains("external_id is not yet supported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_ecr_upstream_config_empty_role_arn_is_accepted() {
+        // An empty / whitespace role_arn is treated as unset, not a rejection.
+        let json =
+            build_ecr_upstream_config(Some("us-west-2"), None, Some("  "), Some("")).unwrap();
+        assert!(crate::services::ecr_auth::parse_aws_ecr_config(&json).is_ok());
+    }
+
+    #[test]
+    fn test_reject_create_time_ecr() {
+        // aws_ecr is rejected at create time...
+        let err = reject_create_time_ecr(Some("aws_ecr")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be configured at repository creation"),
+            "got: {err}"
+        );
+        // ...while static and absent types pass.
+        assert!(reject_create_time_ecr(Some("basic")).is_ok());
+        assert!(reject_create_time_ecr(Some("bearer")).is_ok());
+        assert!(reject_create_time_ecr(None).is_ok());
     }
 
     // -----------------------------------------------------------------------

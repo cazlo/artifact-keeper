@@ -64,6 +64,16 @@ pub fn parse_aws_ecr_config(credentials_json: &str) -> Result<AwsEcrConfig> {
     })
 }
 
+/// Serialize stored `aws_ecr` provider config to its JSON shape. Inverse of
+/// [`parse_aws_ecr_config`]. Contains no secrets.
+pub fn build_aws_ecr_config_json(cfg: &AwsEcrConfig) -> String {
+    serde_json::json!({
+        "region": cfg.region,
+        "registry_id": cfg.registry_id,
+    })
+    .to_string()
+}
+
 /// Validate that `upstream_url`'s host is a well-formed ECR registry endpoint
 /// consistent with `cfg`, before any ECR credential is attached to it.
 ///
@@ -324,6 +334,26 @@ mod tests {
             err.to_string().contains("Invalid aws_ecr config JSON"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_build_then_parse_config_roundtrip() {
+        for cfg in [
+            AwsEcrConfig {
+                region: "us-west-2".to_string(),
+                registry_id: Some("123456789012".to_string()),
+            },
+            AwsEcrConfig {
+                region: "eu-west-1".to_string(),
+                registry_id: None,
+            },
+        ] {
+            let json = build_aws_ecr_config_json(&cfg);
+            assert_eq!(parse_aws_ecr_config(&json).unwrap(), cfg);
+            // The serialized config must never carry secret material.
+            assert!(!json.to_lowercase().contains("password"));
+            assert!(!json.to_lowercase().contains("token"));
+        }
     }
 
     // -----------------------------------------------------------------------
