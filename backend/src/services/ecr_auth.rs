@@ -106,7 +106,7 @@ pub fn validate_ecr_upstream_host(upstream_url: &str, cfg: &AwsEcrConfig) -> Res
     }
 
     if let Some(ref rid) = cfg.registry_id {
-        if &account != rid {
+        if account != *rid {
             return Err(AppError::Validation(format!(
                 "ECR upstream host account '{account}' does not match configured registry_id '{rid}'"
             )));
@@ -212,15 +212,14 @@ pub trait EcrTokenProvider: Send + Sync {
 /// loaded lazily once and shared; per call an ECR client is built with the
 /// request region so repos in different regions reuse the same credential
 /// resolution without reloading the chain.
+#[derive(Default)]
 pub struct RealEcrTokenProvider {
     base_config: tokio::sync::OnceCell<aws_config::SdkConfig>,
 }
 
 impl RealEcrTokenProvider {
     pub fn new() -> Self {
-        Self {
-            base_config: tokio::sync::OnceCell::new(),
-        }
+        Self::default()
     }
 
     async fn base_config(&self) -> &aws_config::SdkConfig {
@@ -229,12 +228,6 @@ impl RealEcrTokenProvider {
                 aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
             })
             .await
-    }
-}
-
-impl Default for RealEcrTokenProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
