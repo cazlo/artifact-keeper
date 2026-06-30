@@ -10244,6 +10244,59 @@ SHA256:
         assert!(err.to_string().contains("base64"), "got: {err}");
     }
 
+    #[tokio::test]
+    async fn test_ecr_basic_auth_not_forwarded_across_host_redirect() {
+        // Redirect auth-leak guard: an ECR upstream that 3xx-redirects to an
+        // unrelated host must NOT forward the ECR `Authorization` header to the
+        // second hop. The SSRF policy does not provide this property (it only
+        // blocks internal addresses); cross-origin `Authorization` stripping
+        // does. This pins that stripping for the ECR Basic credential.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Second hop: an unrelated host (different port => different origin).
+        let second = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&second)
+            .await;
+
+        // First hop redirects cross-origin to `second`.
+        let first = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/v2/manifests/latest", second.uri())),
+            )
+            .mount(&first)
+            .await;
+
+        // We deliberately use a default-redirect-policy client here, NOT the
+        // proxy's `base_client_builder()`: the proxy installs an SSRF redirect
+        // policy that would BLOCK the loopback second hop before stripping could
+        // be observed. reqwest's cross-origin `Authorization` stripping runs in
+        // the redirect loop independent of the redirect `Policy`, so the proxy
+        // client inherits exactly this behavior for real (external) ECR hosts.
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .get(format!("{}/v2/manifests/latest", first.uri()))
+            .basic_auth("AWS", Some("super-secret-ecr-token"))
+            .send()
+            .await
+            .expect("redirect should be followed by the default policy");
+        assert!(resp.status().is_success());
+
+        // The cross-origin second hop must NOT have received the ECR Basic auth.
+        let hops = second.received_requests().await.expect("recording enabled");
+        assert_eq!(hops.len(), 1, "second hop should have been reached once");
+        assert!(
+            hops[0].headers.get("authorization").is_none(),
+            "ECR Basic auth must not be forwarded across a cross-host redirect",
+        );
+    }
+
     // -- obtain_bearer_token: cache hit short-circuit (no network) -----------
 
     #[tokio::test]
