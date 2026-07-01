@@ -1296,6 +1296,56 @@ impl CachePersister {
     }
 }
 
+/// Refresh a dynamic ECR token this many seconds BEFORE its absolute
+/// `expires_at`. ECR tokens are long-lived (~12h); a small safety margin
+/// re-mints ahead of expiry so a token cannot lapse mid-request without forcing
+/// a fresh mint on every single request.
+const ECR_TOKEN_REFRESH_MARGIN_SECS: i64 = 600;
+/// After a proactive refresh failure, wait this long before retrying the ECR
+/// provider for the same still-valid cached credential.
+const ECR_TOKEN_REFRESH_FAILURE_BACKOFF_SECS: i64 = 60;
+
+/// Cached, decoded ECR Basic credential.
+///
+/// Deliberately does NOT derive `Debug`/`Serialize`: it holds the AWS-vended
+/// password, which must never be logged or persisted. Freshness is driven by
+/// the absolute `expires_at` from ECR, not the relative-TTL math the OCI bearer
+/// cache uses.
+struct EcrCacheEntry {
+    username: String,
+    password: String,
+    expires_at: DateTime<Utc>,
+    next_refresh_after: Option<DateTime<Utc>>,
+}
+
+impl EcrCacheEntry {
+    /// Usable until its absolute ECR expiry. This is distinct from "fresh":
+    /// an entry inside the refresh margin should be refreshed proactively, but
+    /// it is still a valid fallback if that refresh fails.
+    fn is_usable(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at > now
+    }
+
+    /// Fresh if it will not expire within the refresh margin from `now`.
+    fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at > now + chrono::Duration::seconds(ECR_TOKEN_REFRESH_MARGIN_SECS)
+    }
+
+    /// Whether a recent refresh failure has deferred the next refresh attempt.
+    fn refresh_deferred(&self, now: DateTime<Utc>) -> bool {
+        self.next_refresh_after
+            .as_ref()
+            .is_some_and(|next| *next > now)
+    }
+
+    fn to_auth(&self) -> crate::services::upstream_auth::UpstreamAuthType {
+        crate::services::upstream_auth::UpstreamAuthType::Basic {
+            username: self.username.clone(),
+            password: self.password.clone(),
+        }
+    }
+}
+
 /// Owns the upstream HTTP fetch + OCI bearer-token-exchange lifecycle
 /// (#1618 S8 — the highest-risk structural extraction).
 ///
@@ -1323,6 +1373,19 @@ pub(crate) struct UpstreamClient {
     /// In-memory cache for OCI registry bearer tokens.
     /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
     token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
+    /// Pluggable ECR token-minting boundary (`ecr:GetAuthorizationToken`). The
+    /// real impl wraps `aws_sdk_ecr`; unit tests inject a fake. Behind an `Arc`
+    /// so it is cheap to share and trivially swappable.
+    ecr_provider: Arc<dyn crate::services::ecr_auth::EcrTokenProvider>,
+    /// In-memory, per-node cache for dynamically minted ECR Basic credentials.
+    /// Key: "{region}\0{registry_id}" — non-secret identity dimensions, safe to
+    /// log. Never synced across nodes: each node mints its own token via its own
+    /// credential chain (per-node CloudTrail audit trail).
+    ecr_token_cache: RwLock<HashMap<String, EcrCacheEntry>>,
+    /// Serializes ECR token minting so concurrent cache misses for the same key
+    /// trigger a single `GetAuthorizationToken` call (double-checked locking),
+    /// not a stampede. Cache hits never take this lock.
+    ecr_refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl UpstreamClient {
@@ -1330,11 +1393,228 @@ impl UpstreamClient {
     /// Starts with an empty bearer-token cache (matching the previous
     /// `ProxyService::new` initialization exactly).
     pub(crate) fn new(db: PgPool, http_client: Client) -> Self {
+        Self::with_ecr_provider(
+            db,
+            http_client,
+            Arc::new(crate::services::ecr_auth::RealEcrTokenProvider::new()),
+        )
+    }
+
+    /// Construct an `UpstreamClient` with an explicit ECR token provider. Used
+    /// by [`Self::new`] (real `aws_sdk_ecr` provider) and by unit tests (fake
+    /// provider). Starts with empty bearer and ECR caches.
+    pub(crate) fn with_ecr_provider(
+        db: PgPool,
+        http_client: Client,
+        ecr_provider: Arc<dyn crate::services::ecr_auth::EcrTokenProvider>,
+    ) -> Self {
         Self {
             db,
             http_client,
             token_cache: RwLock::new(HashMap::new()),
+            ecr_provider,
+            ecr_token_cache: RwLock::new(HashMap::new()),
+            ecr_refresh_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Resolve the effective upstream auth for a request to `repo_id` targeting
+    /// `request_url`.
+    ///
+    /// This is the single entry point the proxy fetch paths use in place of the
+    /// static [`crate::services::upstream_auth::load_upstream_auth`]. It returns
+    /// the same `UpstreamAuthType`, so `apply_upstream_auth` and the
+    /// bearer-forward match in [`Self::obtain_bearer_token`] consume it
+    /// unchanged.
+    ///
+    /// It resolves static Basic/Bearer, and the `aws_ecr` dynamic provider into
+    /// an effective short-lived Basic credential. The `aws_ecr` arm needs
+    /// `request_url` for ECR host-shape validation, which is why the URL is
+    /// threaded through here even though the static path ignores it.
+    pub(crate) async fn resolve_upstream_auth(
+        &self,
+        repo_id: Uuid,
+        request_url: &str,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        // Dispatch on the stored selector BEFORE touching the static parser, so
+        // `aws_ecr` never reaches `parse_auth_credentials` (which only knows
+        // static types).
+        let auth_type = match crate::services::upstream_auth::get_upstream_auth_type(
+            &self.db, repo_id,
+        )
+        .await?
+        {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        if auth_type == "aws_ecr" {
+            return self.resolve_ecr_auth(repo_id, request_url).await.map(Some);
+        }
+
+        // Static Basic/Bearer (and, by documented design, an unrecognized type
+        // maps to None). `load_upstream_auth` re-reads the type row — a single
+        // cheap indexed config read — and keeps the static path unchanged.
+        crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await
+    }
+
+    /// Resolve an `aws_ecr` upstream to an effective Basic credential for
+    /// `request_url`.
+    ///
+    /// Validates the upstream host shape on EVERY call (even cache hits) so a
+    /// minted ECR token is never attached to a non-ECR / mismatched upstream,
+    /// then returns a cached credential or mints+caches a fresh one.
+    async fn resolve_ecr_auth(
+        &self,
+        repo_id: Uuid,
+        request_url: &str,
+    ) -> Result<crate::services::upstream_auth::UpstreamAuthType> {
+        let cfg = self.load_ecr_config(repo_id).await?;
+        // Host-shape safety BEFORE the cache: refuse to attach ECR creds to a
+        // non-ECR / mismatched upstream regardless of cache state. The SSRF
+        // policy does not provide this — it only blocks internal addresses.
+        crate::services::ecr_auth::validate_ecr_upstream_host(request_url, &cfg)?;
+        self.ecr_basic_for_config(&cfg).await
+    }
+
+    /// Load + parse the stored, non-secret `aws_ecr` provider config for a repo.
+    async fn load_ecr_config(
+        &self,
+        repo_id: Uuid,
+    ) -> Result<crate::services::ecr_auth::AwsEcrConfig> {
+        let json = crate::services::upstream_auth::load_credentials_json(&self.db, repo_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Config(
+                    "aws_ecr upstream auth is configured but provider config is missing"
+                        .to_string(),
+                )
+            })?;
+        crate::services::ecr_auth::parse_aws_ecr_config(&json)
+    }
+
+    /// Cache-fronted ECR credential resolution for an already-loaded config.
+    ///
+    /// Separated from [`Self::resolve_ecr_auth`] (which does the DB read + host
+    /// validation) so the cache / mint / decode / singleflight logic is
+    /// unit-testable with a fake provider and no database.
+    async fn ecr_basic_for_config(
+        &self,
+        cfg: &crate::services::ecr_auth::AwsEcrConfig,
+    ) -> Result<crate::services::upstream_auth::UpstreamAuthType> {
+        let key = Self::ecr_cache_key(cfg);
+
+        let now = Utc::now();
+        if let Some(cred) = self.get_cached_ecr(&key, now).await {
+            return Ok(cred);
+        }
+
+        // Double-checked locking: serialize concurrent misses so the same key
+        // mints exactly once. The lock is held across the (rare) provider call;
+        // cache hits above never take it.
+        let _guard = self.ecr_refresh_lock.lock().await;
+        let now = Utc::now();
+        if let Some(cred) = self.get_cached_ecr(&key, now).await {
+            return Ok(cred);
+        }
+
+        let refresh_result = match self.ecr_provider.get_authorization_token(cfg).await {
+            Ok(data) => {
+                crate::services::ecr_auth::decode_ecr_authorization_token(&data.authorization_token)
+                    .and_then(|(username, password)| {
+                        if data.expires_at <= Utc::now() {
+                            return Err(AppError::Storage(
+                                "ECR authorization token is already expired".to_string(),
+                            ));
+                        }
+                        Ok((username, password, data.expires_at))
+                    })
+            }
+            Err(err) => Err(err),
+        };
+
+        let (username, password, expires_at) = match refresh_result {
+            Ok(v) => v,
+            Err(err) => return self.handle_ecr_refresh_error(&key, cfg, err).await,
+        };
+
+        {
+            let now = Utc::now();
+            let mut cache = self.ecr_token_cache.write().await;
+            // Evict entries already past their absolute expiry to bound growth.
+            cache.retain(|_, e| e.is_usable(now));
+            cache.insert(
+                key,
+                EcrCacheEntry {
+                    username: username.clone(),
+                    password: password.clone(),
+                    expires_at,
+                    next_refresh_after: None,
+                },
+            );
+        }
+
+        Ok(crate::services::upstream_auth::UpstreamAuthType::Basic { username, password })
+    }
+
+    /// Return a cached ECR Basic credential if no provider call should be made.
+    ///
+    /// Fresh entries are returned immediately. Near-expiry entries are returned
+    /// only while a recent refresh failure has deferred the next provider retry.
+    async fn get_cached_ecr(
+        &self,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Option<crate::services::upstream_auth::UpstreamAuthType> {
+        let cache = self.ecr_token_cache.read().await;
+        let entry = cache.get(key)?;
+        if entry.is_fresh(now) || (entry.is_usable(now) && entry.refresh_deferred(now)) {
+            Some(entry.to_auth())
+        } else {
+            None
+        }
+    }
+
+    /// Serve a still-valid cached ECR credential after a refresh failure, and
+    /// set a bounded retry cooldown so a temporary AWS failure does not produce
+    /// one provider call per proxied request. Expired cached credentials are
+    /// never served.
+    async fn handle_ecr_refresh_error(
+        &self,
+        key: &str,
+        cfg: &crate::services::ecr_auth::AwsEcrConfig,
+        err: AppError,
+    ) -> Result<crate::services::upstream_auth::UpstreamAuthType> {
+        let now = Utc::now();
+        let next_refresh_after =
+            now + chrono::Duration::seconds(ECR_TOKEN_REFRESH_FAILURE_BACKOFF_SECS);
+        let mut cache = self.ecr_token_cache.write().await;
+        cache.retain(|_, e| e.is_usable(now));
+
+        if let Some(entry) = cache.get_mut(key) {
+            entry.next_refresh_after = Some(next_refresh_after);
+            tracing::warn!(
+                ecr_region = %cfg.region,
+                ecr_registry_id = cfg.registry_id.as_deref().unwrap_or(""),
+                expires_at = %entry.expires_at,
+                next_refresh_after = %next_refresh_after,
+                error = %err,
+                "ECR token refresh failed; serving still-valid cached credential"
+            );
+            return Ok(entry.to_auth());
+        }
+
+        Err(err)
+    }
+
+    /// Build the ECR cache key from non-secret identity dimensions (region +
+    /// registry/account). Safe to log. A future per-repo `role_arn` extends this.
+    fn ecr_cache_key(cfg: &crate::services::ecr_auth::AwsEcrConfig) -> String {
+        format!(
+            "{}\0{}",
+            cfg.region,
+            cfg.registry_id.as_deref().unwrap_or("")
+        )
     }
 
     /// Buffered upstream fetch. Relocated verbatim from
@@ -1362,8 +1642,7 @@ impl UpstreamClient {
             accept
         );
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self.resolve_upstream_auth(repo_id, url).await?;
 
         let mut request = self.http_client.get(url);
         if let Some(ref auth) = upstream_auth {
@@ -1490,8 +1769,7 @@ impl UpstreamClient {
     async fn fetch_stream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamStream> {
         tracing::info!("Fetching artifact from upstream (streaming): {}", url);
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self.resolve_upstream_auth(repo_id, url).await?;
 
         let mut request = self.http_client.get(url);
         if let Some(ref auth) = upstream_auth {
@@ -1794,8 +2072,7 @@ impl UpstreamClient {
         cached_etag: &str,
         repo_id: Uuid,
     ) -> Result<bool> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self.resolve_upstream_auth(repo_id, url).await?;
 
         let mut request = self
             .http_client
@@ -3677,6 +3954,24 @@ impl ProxyService {
         repo_id: Uuid,
     ) -> Result<UpstreamStream> {
         self.upstream_client.fetch_stream(url, repo_id).await
+    }
+
+    /// Resolve the effective upstream auth for a request to `repo_id` targeting
+    /// `request_url`, including dynamic providers (e.g. `aws_ecr`).
+    ///
+    /// Thin public delegate to [`UpstreamClient::resolve_upstream_auth`] so
+    /// non-proxy callers that hold an `Arc<ProxyService>` — notably the
+    /// `test_upstream` handler via `AppState.proxy_service` — can resolve
+    /// dynamic upstream auth without reaching into the private `UpstreamClient`
+    /// or its ECR token cache.
+    pub async fn resolve_upstream_auth(
+        &self,
+        repo_id: Uuid,
+        request_url: &str,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        self.upstream_client
+            .resolve_upstream_auth(repo_id, request_url)
+            .await
     }
 
     /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
@@ -9829,6 +10124,521 @@ SHA256:
         let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
         let client = UpstreamClient::new(pool, Client::new());
         assert!(client.get_cached_token("nope").await.is_none());
+    }
+
+    // =======================================================================
+    // ECR dynamic upstream auth: cache / mint / decode / singleflight.
+    //
+    // These drive `UpstreamClient::ecr_basic_for_config` directly with a fake
+    // `EcrTokenProvider`, so they are hermetic — no DB (a lazy pool is never
+    // queried by this path), no network, no AWS. The DB-backed `resolve_ecr_auth`
+    // / `load_ecr_config` / host-validation wiring is exercised separately; the
+    // pure host/decode/config logic is unit-tested in `services::ecr_auth`.
+    // =======================================================================
+
+    #[derive(Clone)]
+    enum FakeEcrOutcome {
+        Token {
+            password: String,
+            expires_at: DateTime<Utc>,
+        },
+        RawToken {
+            authorization_token: String,
+            expires_at: DateTime<Utc>,
+        },
+        Error(String),
+    }
+
+    impl FakeEcrOutcome {
+        fn token(password: &str, expires_at: DateTime<Utc>) -> Self {
+            Self::Token {
+                password: password.to_string(),
+                expires_at,
+            }
+        }
+
+        fn raw(authorization_token: &str, expires_at: DateTime<Utc>) -> Self {
+            Self::RawToken {
+                authorization_token: authorization_token.to_string(),
+                expires_at,
+            }
+        }
+
+        fn error(message: &str) -> Self {
+            Self::Error(message.to_string())
+        }
+    }
+
+    /// Fake ECR provider returning queued outcomes, counting calls so a
+    /// stampede (more than one mint per cache key) is observable.
+    struct FakeEcrProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        outcomes: tokio::sync::Mutex<std::collections::VecDeque<FakeEcrOutcome>>,
+        /// Optional latency so concurrent callers actually contend on the
+        /// refresh lock instead of finishing instantly in sequence.
+        delay: Duration,
+    }
+
+    impl FakeEcrProvider {
+        fn new(outcomes: impl IntoIterator<Item = FakeEcrOutcome>) -> Arc<Self> {
+            Self::with_delay(outcomes, Duration::ZERO)
+        }
+
+        fn with_delay(
+            outcomes: impl IntoIterator<Item = FakeEcrOutcome>,
+            delay: Duration,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                outcomes: tokio::sync::Mutex::new(outcomes.into_iter().collect()),
+                delay,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::ecr_auth::EcrTokenProvider for FakeEcrProvider {
+        async fn get_authorization_token(
+            &self,
+            _cfg: &crate::services::ecr_auth::AwsEcrConfig,
+        ) -> Result<crate::services::ecr_auth::EcrAuthorizationData> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+
+            let outcome = {
+                let mut outcomes = self.outcomes.lock().await;
+                outcomes.pop_front()
+            };
+
+            match outcome.unwrap_or_else(|| {
+                FakeEcrOutcome::error("fake ECR provider called more times than expected")
+            }) {
+                FakeEcrOutcome::Token {
+                    password,
+                    expires_at,
+                } => Ok(crate::services::ecr_auth::EcrAuthorizationData {
+                    authorization_token: ecr_b64(&format!("AWS:{password}")),
+                    expires_at,
+                }),
+                FakeEcrOutcome::RawToken {
+                    authorization_token,
+                    expires_at,
+                } => Ok(crate::services::ecr_auth::EcrAuthorizationData {
+                    authorization_token,
+                    expires_at,
+                }),
+                FakeEcrOutcome::Error(message) => Err(AppError::Storage(message)),
+            }
+        }
+    }
+
+    fn ecr_b64(s: &str) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+    }
+
+    fn test_ecr_cfg() -> crate::services::ecr_auth::AwsEcrConfig {
+        crate::services::ecr_auth::AwsEcrConfig {
+            region: "us-west-2".to_string(),
+            registry_id: Some("123456789012".to_string()),
+        }
+    }
+
+    /// Build an `UpstreamClient` (lazy, never-queried pool) wired to `provider`.
+    fn ecr_client(provider: Arc<FakeEcrProvider>) -> UpstreamClient {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        UpstreamClient::with_ecr_provider(pool, Client::new(), provider)
+    }
+
+    #[tokio::test]
+    async fn test_ecr_resolves_to_basic_aws_username() {
+        let provider = FakeEcrProvider::new([FakeEcrOutcome::token(
+            "vended-password",
+            Utc::now() + chrono::Duration::hours(12),
+        )]);
+        let client = ecr_client(provider.clone());
+
+        let cred = client.ecr_basic_for_config(&test_ecr_cfg()).await.unwrap();
+        assert_eq!(
+            cred,
+            crate::services::upstream_auth::UpstreamAuthType::Basic {
+                username: "AWS".to_string(),
+                password: "vended-password".to_string(),
+            }
+        );
+        assert_eq!(provider.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ecr_cache_hit_does_not_remint() {
+        let provider = FakeEcrProvider::new([FakeEcrOutcome::token(
+            "vended-password",
+            Utc::now() + chrono::Duration::hours(12),
+        )]);
+        let client = ecr_client(provider.clone());
+        let cfg = test_ecr_cfg();
+
+        let first = client.ecr_basic_for_config(&cfg).await.unwrap();
+        let second = client.ecr_basic_for_config(&cfg).await.unwrap();
+        assert_eq!(first, second);
+        // A fresh entry (12h out) is a cache hit on the second call: one mint.
+        assert_eq!(provider.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ecr_near_expiry_entry_refresh_success_updates_cache() {
+        let now = Utc::now();
+        let provider = FakeEcrProvider::new([
+            FakeEcrOutcome::token("old-password", now + chrono::Duration::minutes(5)),
+            FakeEcrOutcome::token("new-password", now + chrono::Duration::hours(12)),
+        ]);
+        let client = ecr_client(provider.clone());
+        let cfg = test_ecr_cfg();
+
+        let first = client.ecr_basic_for_config(&cfg).await.unwrap();
+        assert_eq!(
+            first,
+            crate::services::upstream_auth::UpstreamAuthType::Basic {
+                username: "AWS".to_string(),
+                password: "old-password".to_string(),
+            }
+        );
+
+        let second = client.ecr_basic_for_config(&cfg).await.unwrap();
+        assert_eq!(
+            second,
+            crate::services::upstream_auth::UpstreamAuthType::Basic {
+                username: "AWS".to_string(),
+                password: "new-password".to_string(),
+            }
+        );
+
+        let third = client.ecr_basic_for_config(&cfg).await.unwrap();
+        assert_eq!(third, second);
+        assert_eq!(
+            provider.calls(),
+            2,
+            "near-expiry entry should refresh once, then hit the fresh cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ecr_near_expiry_refresh_failure_serves_still_valid_cache() {
+        let now = Utc::now();
+        let provider = FakeEcrProvider::new([
+            FakeEcrOutcome::token("still-valid", now + chrono::Duration::minutes(5)),
+            FakeEcrOutcome::error("simulated ECR throttling"),
+        ]);
+        let client = ecr_client(provider.clone());
+        let cfg = test_ecr_cfg();
+
+        let first = client.ecr_basic_for_config(&cfg).await.unwrap();
+        let second = client.ecr_basic_for_config(&cfg).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            second,
+            crate::services::upstream_auth::UpstreamAuthType::Basic {
+                username: "AWS".to_string(),
+                password: "still-valid".to_string(),
+            }
+        );
+        assert_eq!(
+            provider.calls(),
+            2,
+            "near-expiry refresh failure should serve the cached token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ecr_refresh_failure_cooldown_avoids_per_request_mint_storm() {
+        let now = Utc::now();
+        let provider = FakeEcrProvider::new([
+            FakeEcrOutcome::token("still-valid", now + chrono::Duration::minutes(5)),
+            FakeEcrOutcome::error("simulated ECR outage"),
+        ]);
+        let client = ecr_client(provider.clone());
+        let cfg = test_ecr_cfg();
+
+        let first = client.ecr_basic_for_config(&cfg).await.unwrap();
+        let second = client.ecr_basic_for_config(&cfg).await.unwrap();
+        let third = client.ecr_basic_for_config(&cfg).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+        assert_eq!(
+            provider.calls(),
+            2,
+            "cooldown should avoid retrying the provider on every request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ecr_concurrent_resolves_single_flight() {
+        // Many concurrent resolves for the same key must trigger ONE mint
+        // (double-checked locking), not a stampede.
+        let provider = FakeEcrProvider::with_delay(
+            [FakeEcrOutcome::token(
+                "vended-password",
+                Utc::now() + chrono::Duration::hours(12),
+            )],
+            Duration::from_millis(50),
+        );
+        let client = ecr_client(provider.clone());
+        let cfg = test_ecr_cfg();
+
+        let results =
+            futures::future::join_all((0..10).map(|_| client.ecr_basic_for_config(&cfg))).await;
+        for r in &results {
+            assert_eq!(
+                r.as_ref().unwrap(),
+                &crate::services::upstream_auth::UpstreamAuthType::Basic {
+                    username: "AWS".to_string(),
+                    password: "vended-password".to_string(),
+                }
+            );
+        }
+        assert_eq!(
+            provider.calls(),
+            1,
+            "concurrent resolves for one key must mint exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ecr_near_expiry_refresh_failure_is_singleflight() {
+        let now = Utc::now();
+        let provider = FakeEcrProvider::with_delay(
+            [
+                FakeEcrOutcome::token("still-valid", now + chrono::Duration::minutes(5)),
+                FakeEcrOutcome::error("simulated ECR outage"),
+            ],
+            Duration::from_millis(50),
+        );
+        let client = ecr_client(provider.clone());
+        let cfg = test_ecr_cfg();
+
+        let primed = client.ecr_basic_for_config(&cfg).await.unwrap();
+        let results =
+            futures::future::join_all((0..10).map(|_| client.ecr_basic_for_config(&cfg))).await;
+        for r in &results {
+            assert_eq!(r.as_ref().unwrap(), &primed);
+        }
+        assert_eq!(
+            provider.calls(),
+            2,
+            "only one concurrent caller should observe and record the refresh failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ecr_provider_error_propagates_and_is_not_cached_without_fallback() {
+        let provider = FakeEcrProvider::new([
+            FakeEcrOutcome::error("simulated ECR AccessDenied"),
+            FakeEcrOutcome::error("simulated ECR AccessDenied"),
+        ]);
+        let client = ecr_client(provider.clone());
+        let cfg = test_ecr_cfg();
+
+        assert!(client.ecr_basic_for_config(&cfg).await.is_err());
+        // A failed mint must not be cached as success: the next call re-tries
+        // the provider when no usable fallback exists.
+        assert!(client.ecr_basic_for_config(&cfg).await.is_err());
+        assert_eq!(provider.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_ecr_expired_cached_token_refresh_failure_errors() {
+        let provider = FakeEcrProvider::new([FakeEcrOutcome::error("simulated ECR outage")]);
+        let client = ecr_client(provider.clone());
+        let cfg = test_ecr_cfg();
+        {
+            let mut cache = client.ecr_token_cache.write().await;
+            cache.insert(
+                UpstreamClient::ecr_cache_key(&cfg),
+                EcrCacheEntry {
+                    username: "AWS".to_string(),
+                    password: "expired-password".to_string(),
+                    expires_at: Utc::now() - chrono::Duration::seconds(1),
+                    next_refresh_after: Some(Utc::now() + chrono::Duration::minutes(1)),
+                },
+            );
+        }
+
+        assert!(client.ecr_basic_for_config(&cfg).await.is_err());
+        assert_eq!(provider.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ecr_invalid_authorization_token_is_clean_error() {
+        let provider = FakeEcrProvider::new([FakeEcrOutcome::raw(
+            "!!!not-base64!!!",
+            Utc::now() + chrono::Duration::hours(12),
+        )]);
+        let client = ecr_client(provider.clone());
+
+        let err = client
+            .ecr_basic_for_config(&test_ecr_cfg())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("base64"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_upstream_auth_loads_persisted_aws_ecr_config() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let cfg = test_ecr_cfg();
+        crate::services::upstream_auth::save_upstream_auth(
+            &pool,
+            repo_id,
+            "aws_ecr",
+            &crate::services::ecr_auth::build_aws_ecr_config_json(&cfg),
+        )
+        .await
+        .expect("save aws_ecr config");
+
+        let provider = FakeEcrProvider::new([FakeEcrOutcome::token(
+            "db-vended-password",
+            Utc::now() + chrono::Duration::hours(12),
+        )]);
+        let client =
+            UpstreamClient::with_ecr_provider(pool.clone(), Client::new(), provider.clone());
+
+        let result = client
+            .resolve_upstream_auth(
+                repo_id,
+                "https://123456789012.dkr.ecr.us-west-2.amazonaws.com/v2/library/alpine/manifests/latest",
+            )
+            .await;
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("delete test repo");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let auth = result.expect("resolve persisted aws_ecr config").unwrap();
+        assert_eq!(
+            auth,
+            crate::services::upstream_auth::UpstreamAuthType::Basic {
+                username: "AWS".to_string(),
+                password: "db-vended-password".to_string(),
+            }
+        );
+        assert_eq!(provider.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_upstream_auth_rejects_non_ecr_host_without_provider_call() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let cfg = test_ecr_cfg();
+        crate::services::upstream_auth::save_upstream_auth(
+            &pool,
+            repo_id,
+            "aws_ecr",
+            &crate::services::ecr_auth::build_aws_ecr_config_json(&cfg),
+        )
+        .await
+        .expect("save aws_ecr config");
+
+        let provider = FakeEcrProvider::new([FakeEcrOutcome::token(
+            "must-not-be-called",
+            Utc::now() + chrono::Duration::hours(12),
+        )]);
+        let client =
+            UpstreamClient::with_ecr_provider(pool.clone(), Client::new(), provider.clone());
+
+        let result = client
+            .resolve_upstream_auth(
+                repo_id,
+                "https://registry-1.docker.io/v2/library/alpine/manifests/latest",
+            )
+            .await;
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("delete test repo");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(result, Err(AppError::Validation(_))),
+            "expected host validation error before provider call, got: {result:?}",
+        );
+        assert_eq!(provider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ecr_basic_auth_not_forwarded_across_host_redirect() {
+        // Redirect auth-leak guard: an ECR upstream that 3xx-redirects to an
+        // unrelated host must NOT forward the ECR `Authorization` header to the
+        // second hop. The SSRF policy does not provide this property (it only
+        // blocks internal addresses); cross-origin `Authorization` stripping
+        // does. This pins that stripping for the ECR Basic credential.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Second hop: an unrelated host (different port => different origin).
+        let second = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&second)
+            .await;
+
+        // First hop redirects cross-origin to `second`.
+        let first = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/v2/manifests/latest", second.uri())),
+            )
+            .mount(&first)
+            .await;
+
+        // We deliberately use a default-redirect-policy client here, NOT the
+        // proxy's `base_client_builder()`: the proxy installs an SSRF redirect
+        // policy that would BLOCK the loopback second hop before stripping could
+        // be observed. reqwest's cross-origin `Authorization` stripping runs in
+        // the redirect loop independent of the redirect `Policy`, so the proxy
+        // client inherits exactly this behavior for real (external) ECR hosts.
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .get(format!("{}/v2/manifests/latest", first.uri()))
+            .basic_auth("AWS", Some("super-secret-ecr-token"))
+            .send()
+            .await
+            .expect("redirect should be followed by the default policy");
+        assert!(resp.status().is_success());
+
+        // The cross-origin second hop must NOT have received the ECR Basic auth.
+        let hops = second.received_requests().await.expect("recording enabled");
+        assert_eq!(hops.len(), 1, "second hop should have been reached once");
+        assert!(
+            hops[0].headers.get("authorization").is_none(),
+            "ECR Basic auth must not be forwarded across a cross-host redirect",
+        );
     }
 
     // -- obtain_bearer_token: cache hit short-circuit (no network) -----------

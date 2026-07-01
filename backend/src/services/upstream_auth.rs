@@ -12,18 +12,83 @@ use crate::services::auth_config_service::encryption_key;
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
 
 /// Auth types supported for upstream repositories.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is hand-written (NOT derived) so the secret material — the Basic
+/// `password` and the Bearer `token` — is never printed. The dynamic ECR
+/// resolver returns `Basic { username: "AWS", password: <AWS-vended token> }`,
+/// so a derived `Debug` would risk leaking a live registry token into logs or
+/// error chains; the redacting impl below keeps the variant + non-secret
+/// `username` for debuggability while masking the credential. See
+/// `test_upstream_auth_type_debug_redacts_*`.
+#[derive(Clone, PartialEq)]
 pub enum UpstreamAuthType {
     Basic { username: String, password: String },
     Bearer { token: String },
 }
 
-/// Load upstream auth credentials for a repository.
-/// Returns None if no auth is configured.
+impl std::fmt::Debug for UpstreamAuthType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Keep the non-secret `username` (e.g. "AWS" for ECR) for
+            // debugging; mask the password.
+            UpstreamAuthType::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            UpstreamAuthType::Bearer { .. } => f
+                .debug_struct("Bearer")
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+/// Load **static** upstream auth credentials (Basic/Bearer) for a repository.
+/// Returns `None` if no auth is configured.
+///
+/// This is the static-only path. Dynamic provider types (e.g. `aws_ecr`) store
+/// provider *config* — not on-wire secrets — under the same encrypted key and
+/// are resolved by [`crate::services::proxy_service`]'s
+/// `UpstreamClient::resolve_upstream_auth`, never here. For such a row this
+/// returns `Ok(None)` **by documented design** so static-only callers (the
+/// scheduler curation sync) degrade to "no static auth" rather than erroring on
+/// an unrecognized type. Callers that must honor dynamic auth (the proxy fetch
+/// paths, `test_upstream`) go through the resolver instead.
 pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<UpstreamAuthType>> {
-    // Load auth type
-    let auth_type: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'upstream_auth_type'",
+    let auth_type = match get_upstream_auth_type(db, repo_id).await? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    // See the doc comment: dynamic provider types are resolved elsewhere.
+    if !is_static_auth_type(&auth_type) {
+        return Ok(None);
+    }
+
+    let credentials_json = load_credentials_json(db, repo_id).await?.ok_or_else(|| {
+        AppError::Config("Upstream auth type is configured but credentials are missing".to_string())
+    })?;
+
+    parse_credentials_json(&auth_type, &credentials_json).map(Some)
+}
+
+/// Whether `auth_type` is a static on-wire credential type that
+/// [`load_upstream_auth`] resolves directly. Dynamic provider types such as
+/// `aws_ecr` are intentionally excluded: they resolve through the
+/// `UpstreamClient` resolver, which mints/caches an effective credential.
+pub(crate) fn is_static_auth_type(auth_type: &str) -> bool {
+    matches!(auth_type, "basic" | "bearer")
+}
+
+/// Read and decrypt the stored `upstream_auth_credentials` JSON for a repo.
+/// Returns `None` when no credentials row exists. The decrypted JSON is the
+/// provider-specific shape: static Basic/Bearer secrets, or `aws_ecr` provider
+/// config (region/registry_id). Shared by the static loader and the dynamic
+/// ECR config loader so the read+decrypt lives in exactly one place.
+pub(crate) async fn load_credentials_json(db: &PgPool, repo_id: Uuid) -> Result<Option<String>> {
+    let encrypted_hex: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'upstream_auth_credentials'",
     )
     .bind(repo_id)
     .fetch_optional(db)
@@ -31,29 +96,10 @@ pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<Ups
     .map_err(|e| AppError::Database(e.to_string()))?
     .flatten();
 
-    let auth_type = match filter_auth_type(auth_type) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-
-    // Load and decrypt credentials
-    let encrypted_hex: String = sqlx::query_scalar(
-        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'upstream_auth_credentials'",
-    )
-    .bind(repo_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .flatten()
-    .ok_or_else(|| {
-        AppError::Config(
-            "Upstream auth type is configured but credentials are missing".to_string(),
-        )
-    })?;
-
-    let credentials_json = decrypt_credentials_hex(&encrypted_hex, &encryption_key())?;
-
-    parse_credentials_json(&auth_type, &credentials_json).map(Some)
+    match encrypted_hex {
+        Some(hex) => Ok(Some(decrypt_credentials_hex(&hex, &encryption_key())?)),
+        None => Ok(None),
+    }
 }
 
 /// Parse auth credentials from a JSON value given an auth type string.
@@ -376,6 +422,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // is_static_auth_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_static_auth_type() {
+        assert!(is_static_auth_type("basic"));
+        assert!(is_static_auth_type("bearer"));
+        // Dynamic provider types are NOT static and must be resolved elsewhere.
+        assert!(!is_static_auth_type("aws_ecr"));
+        // Unknown / sentinel values are not static either.
+        assert!(!is_static_auth_type("none"));
+        assert!(!is_static_auth_type(""));
+        assert!(!is_static_auth_type("oauth2"));
+    }
+
+    // -----------------------------------------------------------------------
     // build_credentials_json
     // -----------------------------------------------------------------------
 
@@ -439,13 +501,38 @@ mod tests {
     }
 
     #[test]
-    fn test_upstream_auth_type_debug() {
+    fn test_upstream_auth_type_debug_redacts_token() {
+        // The Bearer token is secret material (and, for ECR, an AWS-vended
+        // registry token). It must NEVER appear in Debug output. Use a
+        // distinctive value that does not collide with the "token" field
+        // name so the negative assertion is meaningful.
         let auth = UpstreamAuthType::Bearer {
-            token: "tok".to_string(),
+            token: "s3cr3t-bearer-value-xyz".to_string(),
         };
         let debug = format!("{:?}", auth);
         assert!(debug.contains("Bearer"));
-        assert!(debug.contains("tok"));
+        assert!(
+            !debug.contains("s3cr3t-bearer-value-xyz"),
+            "token must not appear in Debug output: {debug}"
+        );
+        assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn test_upstream_auth_type_debug_redacts_basic_password() {
+        let auth = UpstreamAuthType::Basic {
+            username: "AWS".to_string(),
+            password: "s3cr3t-basic-pw-xyz".to_string(),
+        };
+        let debug = format!("{:?}", auth);
+        assert!(debug.contains("Basic"));
+        // username is not secret; keep it for debuggability.
+        assert!(debug.contains("AWS"));
+        assert!(
+            !debug.contains("s3cr3t-basic-pw-xyz"),
+            "password must not appear in Debug output: {debug}"
+        );
+        assert!(debug.contains("redacted"));
     }
 
     #[test]
