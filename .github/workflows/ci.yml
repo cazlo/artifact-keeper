@@ -702,7 +702,8 @@ jobs:
       #     virtual_members_atomicity_test, virtual_members_duplicate_test,
       #     grpc_sbom_tests (in-process gRPC, no HTTP server),
       #     oci_chunked_upload_cross_repo_tests (#1317 cross-repo session
-      #     rejection regression).
+      #     rejection regression), oci_upload_range_test (#1410 Range
+      #     response header + resume-contract HTTP-level coverage).
       #
       # Deliberately excluded (would panic on first .expect() without
       # extra infra, so `--ignored` stays the right gate):
@@ -738,6 +739,7 @@ jobs:
             --test virtual_members_atomicity_test \
             --test virtual_members_duplicate_test \
             --test oci_chunked_upload_cross_repo_tests \
+            --test oci_upload_range_test \
             -- --ignored --test-threads=1
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
