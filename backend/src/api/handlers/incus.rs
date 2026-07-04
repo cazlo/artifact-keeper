@@ -51,6 +51,7 @@ use crate::formats::incus::IncusHandler;
 /// worker (#1512) so the per-task memory budget is uniform across upload
 /// surfaces.
 const STREAM_CHUNK_BUDGET: usize = 256 * 1024;
+const INCUS_FINALIZE_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -886,7 +887,7 @@ async fn upload_image(
              filename, bytes_received, storage_temp_path, status,
              finalize_token, finalize_claimed_until)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'finalizing',
-                $10, NOW() + INTERVAL '6 hours')
+                $10, NOW() + make_interval(secs => $11))
         "#,
     )
     .bind(session_id)
@@ -899,6 +900,7 @@ async fn upload_image(
     .bind(size_bytes)
     .bind(temp_path.to_string_lossy().as_ref())
     .bind(finalize_token)
+    .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
     .execute(&state.db)
     .await
     .map_err(db_err)?;
@@ -1204,24 +1206,70 @@ async fn claim_incus_finalize_lease(
         UPDATE incus_upload_sessions
         SET status = 'finalizing',
             finalize_token = $2,
-            finalize_claimed_until = NOW() + INTERVAL '6 hours',
+            finalize_claimed_until = NOW() + make_interval(secs => $3),
             updated_at = NOW()
         WHERE id = $1
           AND (
             status = 'receiving'
             OR (
                 status = 'finalizing'
-                AND COALESCE(finalize_claimed_until, updated_at + INTERVAL '6 hours') <= NOW()
+                AND COALESCE(finalize_claimed_until, updated_at + make_interval(secs => $3)) <= NOW()
             )
           )
         "#,
     )
     .bind(session_id)
     .bind(finalize_token)
+    .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
     .execute(db)
     .await?;
 
     Ok((claimed.rows_affected() == 1).then_some(finalize_token))
+}
+
+/// Token-guarded heartbeat for a finalizing Incus upload.
+async fn renew_incus_finalize_lease(
+    db: &PgPool,
+    session_id: Uuid,
+    finalize_token: Uuid,
+    ttl_secs: f64,
+) -> Result<bool, sqlx::Error> {
+    let renewed = sqlx::query(
+        "UPDATE incus_upload_sessions \
+         SET finalize_claimed_until = NOW() + make_interval(secs => $3), updated_at = NOW() \
+         WHERE id = $1 AND status = 'finalizing' AND finalize_token = $2",
+    )
+    .bind(session_id)
+    .bind(finalize_token)
+    .bind(ttl_secs)
+    .execute(db)
+    .await?;
+
+    Ok(renewed.rows_affected() == 1)
+}
+
+fn spawn_incus_finalize_lease_renewal(
+    db: PgPool,
+    session_id: Uuid,
+    finalize_token: Uuid,
+) -> crate::services::cluster_work::RenewalGuard {
+    crate::services::cluster_work::spawn_renewal_loop(
+        format!("incus finalize {session_id}"),
+        INCUS_FINALIZE_LEASE_TTL_SECS,
+        move || {
+            let db = db.clone();
+            async move {
+                renew_incus_finalize_lease(
+                    &db,
+                    session_id,
+                    finalize_token,
+                    INCUS_FINALIZE_LEASE_TTL_SECS,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
+        },
+    )
 }
 
 /// Token-guarded release of a finalize lease back to 'receiving', for
@@ -1706,6 +1754,8 @@ async fn run_finalize(
 /// with the error string, which `GET /incus/{repo}/uploads/{id}` surfaces.
 async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizeParams) {
     let session_id = params.session_id;
+    let finalize_renewal =
+        spawn_incus_finalize_lease_renewal(state.db.clone(), session_id, params.finalize_token);
     match run_finalize(&state, &repo, &params).await {
         Ok(artifact_id) => {
             tracing::info!(
@@ -1756,6 +1806,7 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
             .await;
         }
     }
+    drop(finalize_renewal);
     let _ = tokio::fs::remove_file(&params.temp_path).await;
 }
 
@@ -3767,7 +3818,7 @@ mod streaming_pipeline_regression_tests {
               bytes_received, storage_temp_path, status, finalize_token, \
               finalize_claimed_until) \
              VALUES ($1, $2, $3, $4, 'ubuntu', '1', 'incus.tar.xz', 0, $5, 'finalizing', $6, \
-                     NOW() + INTERVAL '6 hours')",
+                     NOW() + make_interval(secs => $7))",
         )
         .bind(session_id)
         .bind(f.repo_id)
@@ -3775,6 +3826,7 @@ mod streaming_pipeline_regression_tests {
         .bind(&artifact_path)
         .bind(bogus_temp.to_string_lossy().as_ref())
         .bind(finalize_token)
+        .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
         .execute(&f.pool)
         .await
         .expect("insert finalizing session");
@@ -3939,6 +3991,91 @@ mod streaming_pipeline_regression_tests {
             "a stale finalizer must not overwrite the new owner's session state"
         );
         assert!(err.is_none(), "stale finalizer must not record its error");
+
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// A live finalizer can renew before a duplicate complete request
+    /// reclaims the session; once a newer token owns it, the stale token is
+    /// fenced out of renewal.
+    #[tokio::test]
+    async fn finalize_lease_renewal_blocks_reclaim_and_fences_stale_owner() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+
+        let stale_token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("receiving session must be claimable");
+        sqlx::query(
+            "UPDATE incus_upload_sessions \
+             SET finalize_claimed_until = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire lease");
+
+        assert!(
+            renew_incus_finalize_lease(
+                &f.pool,
+                session_id,
+                stale_token,
+                INCUS_FINALIZE_LEASE_TTL_SECS,
+            )
+            .await
+            .expect("renew query ok"),
+            "live owner must be able to extend its token"
+        );
+        assert!(
+            claim_incus_finalize_lease(&f.pool, session_id)
+                .await
+                .expect("claim query ok")
+                .is_none(),
+            "a renewed finalize lease must block duplicate completion"
+        );
+
+        sqlx::query(
+            "UPDATE incus_upload_sessions \
+             SET finalize_claimed_until = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire renewed lease");
+        let fresh_token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("expired finalize lease must be reclaimable");
+
+        assert!(
+            !renew_incus_finalize_lease(
+                &f.pool,
+                session_id,
+                stale_token,
+                INCUS_FINALIZE_LEASE_TTL_SECS,
+            )
+            .await
+            .expect("renew query ok"),
+            "stale token must not renew after a reclaim"
+        );
+        assert!(
+            renew_incus_finalize_lease(
+                &f.pool,
+                session_id,
+                fresh_token,
+                INCUS_FINALIZE_LEASE_TTL_SECS,
+            )
+            .await
+            .expect("renew query ok"),
+            "fresh token must be able to renew"
+        );
 
         let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
             .bind(session_id)

@@ -614,6 +614,7 @@ async fn complete(
     let session = UploadService::complete_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
+    let commit_renewal = UploadService::spawn_commit_lease_renewal(state.db.clone(), &session);
 
     // Resolve the *repo-scoped* storage backend and use a content-addressable
     // key, matching how non-chunked uploads work (issue #1168 part 3).
@@ -773,6 +774,7 @@ async fn complete(
             );
         }
     }
+    drop(commit_renewal);
 
     tracing::info!(
         "Finalized chunked upload {} -> artifact {} ({}B, sha256:{})",
