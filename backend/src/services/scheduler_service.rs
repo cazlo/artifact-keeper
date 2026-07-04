@@ -742,6 +742,114 @@ struct BackupScheduleRow {
     pub backup_type: BackupType,
     pub cron_expression: String,
     pub include_repositories: Option<Vec<uuid::Uuid>>,
+    /// The due occurrence this tick would satisfy: the stored `next_run_at`,
+    /// or epoch for a schedule that has never run. Every replica reads the
+    /// same value, so it is the idempotency key for the run claim.
+    pub due_at: chrono::DateTime<Utc>,
+}
+
+/// TTL for one backup-schedule run claim, in seconds (6 hours).
+///
+/// While the claim is live no other replica can start a run for the same due
+/// time; if the claiming replica dies mid-backup, the run becomes reclaimable
+/// after this long. Sized generously because large archive writes can run for
+/// hours and there is no mid-backup heartbeat yet.
+const BACKUP_RUN_CLAIM_TTL_SECS: f64 = 6.0 * 3600.0;
+
+/// Proof that this process owns one `backup_schedule_runs` row.
+struct BackupRunClaim {
+    run_id: uuid::Uuid,
+    claim_token: uuid::Uuid,
+}
+
+/// Claim the run for `(schedule_id, scheduled_for)` (DueRun pattern, see
+/// [`crate::services::cluster_work`]).
+///
+/// Returns `None` when another replica already produced (or is producing)
+/// this occurrence: a completed/failed run for the key is never re-claimed,
+/// and a live `running` claim is respected. An expired `running` claim
+/// (crashed owner) is reclaimed in place.
+async fn claim_backup_schedule_run(
+    db: &PgPool,
+    schedule_id: uuid::Uuid,
+    scheduled_for: chrono::DateTime<Utc>,
+    claimed_by: &str,
+    claim_ttl_secs: f64,
+) -> crate::error::Result<Option<BackupRunClaim>> {
+    let row: Option<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
+        r#"
+        INSERT INTO backup_schedule_runs
+            (schedule_id, scheduled_for, claimed_by, claim_token, claim_expires_at)
+        VALUES ($1, $2, $3, gen_random_uuid(), NOW() + make_interval(secs => $4))
+        ON CONFLICT (schedule_id, scheduled_for) DO UPDATE
+        SET claimed_by = EXCLUDED.claimed_by,
+            claim_token = EXCLUDED.claim_token,
+            claim_expires_at = EXCLUDED.claim_expires_at,
+            started_at = NOW()
+        WHERE backup_schedule_runs.status = 'running'
+          AND backup_schedule_runs.claim_expires_at <= NOW()
+        RETURNING id, claim_token
+        "#,
+    )
+    .bind(schedule_id)
+    .bind(scheduled_for)
+    .bind(claimed_by)
+    .bind(claim_ttl_secs)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+    Ok(row.map(|(run_id, claim_token)| BackupRunClaim {
+        run_id,
+        claim_token,
+    }))
+}
+
+/// Record the run outcome, token-guarded. Returns `true` when this process
+/// still owned the run — only then may the caller update the schedule's
+/// `last_run_at`/`next_run_at` bookkeeping.
+async fn finalize_backup_schedule_run(
+    db: &PgPool,
+    claim: &BackupRunClaim,
+    succeeded: bool,
+    backup_id: Option<uuid::Uuid>,
+    error_message: Option<&str>,
+) -> bool {
+    let result = sqlx::query(
+        r#"
+        UPDATE backup_schedule_runs
+        SET status = $3,
+            backup_id = $4,
+            error_message = $5,
+            completed_at = NOW()
+        WHERE id = $1
+          AND claim_token = $2
+          AND status = 'running'
+        "#,
+    )
+    .bind(claim.run_id)
+    .bind(claim.claim_token)
+    .bind(if succeeded { "completed" } else { "failed" })
+    .bind(backup_id)
+    .bind(error_message)
+    .execute(db)
+    .await;
+
+    match result {
+        Ok(r) if r.rows_affected() == 1 => true,
+        Ok(_) => {
+            tracing::warn!(
+                run_id = %claim.run_id,
+                "backup run finished but its claim was lost (expired and re-claimed); \
+                 skipping schedule bookkeeping"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(run_id = %claim.run_id, error = %e, "failed to finalize backup run");
+            false
+        }
+    }
 }
 
 /// Check for due backup schedules and execute them.
@@ -749,7 +857,8 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
     // Find schedules where next_run_at <= now
     let due_schedules = sqlx::query_as::<_, BackupScheduleRow>(
         r#"
-        SELECT id, name, backup_type, cron_expression, include_repositories
+        SELECT id, name, backup_type, cron_expression, include_repositories,
+               COALESCE(next_run_at, 'epoch'::timestamptz) AS due_at
         FROM backup_schedules
         WHERE is_enabled = true
           AND (next_run_at IS NULL OR next_run_at <= NOW())
@@ -777,6 +886,37 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
     };
 
     for schedule_row in &due_schedules {
+        // Claim this due occurrence BEFORE creating/executing anything: the
+        // claim is what stops other replicas (whose 5-minute ticks overlap
+        // this window) from producing a second archive for the same due time.
+        let claim = match claim_backup_schedule_run(
+            db,
+            schedule_row.id,
+            schedule_row.due_at,
+            crate::services::cluster_work::WorkerIdentity::for_process().as_str(),
+            BACKUP_RUN_CLAIM_TTL_SECS,
+        )
+        .await
+        {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                tracing::debug!(
+                    "Backup schedule '{}' due at {} already claimed/executed by another replica",
+                    schedule_row.name,
+                    schedule_row.due_at
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to claim backup run for schedule '{}': {}",
+                    schedule_row.name,
+                    e
+                );
+                continue;
+            }
+        };
+
         tracing::info!(
             "Executing scheduled backup '{}' (type: {:?})",
             schedule_row.name,
@@ -797,7 +937,7 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
         let backup_type_str = format!("{:?}", schedule_row.backup_type).to_lowercase();
         let start = std::time::Instant::now();
 
-        match create_result {
+        let (succeeded, backup_id, error_message) = match create_result {
             Ok(backup) => match service.execute(backup.id).await {
                 Ok(completed) => {
                     let elapsed = start.elapsed().as_secs_f64();
@@ -808,6 +948,7 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
                         completed.artifact_count.unwrap_or(0)
                     );
                     metrics_service::record_backup(&backup_type_str, true, elapsed);
+                    (true, Some(backup.id), None)
                 }
                 Err(e) => {
                     let elapsed = start.elapsed().as_secs_f64();
@@ -817,6 +958,7 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
                         e
                     );
                     metrics_service::record_backup(&backup_type_str, false, elapsed);
+                    (false, Some(backup.id), Some(e.to_string()))
                 }
             },
             Err(e) => {
@@ -827,18 +969,33 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
                     e
                 );
                 metrics_service::record_backup(&backup_type_str, false, elapsed);
+                (false, None, Some(e.to_string()))
             }
-        }
+        };
 
-        // Compute and update next_run_at from cron expression
-        let next_run = compute_next_run(&schedule_row.cron_expression);
-        let _ = sqlx::query(
-            "UPDATE backup_schedules SET last_run_at = NOW(), next_run_at = $2, updated_at = NOW() WHERE id = $1",
+        // Record the run outcome; only the (still-)owner advances the
+        // schedule bookkeeping, so a stale claimant cannot skip a due time
+        // it never satisfied.
+        let owns_run = finalize_backup_schedule_run(
+            db,
+            &claim,
+            succeeded,
+            backup_id,
+            error_message.as_deref(),
         )
-        .bind(schedule_row.id)
-        .bind(next_run)
-        .execute(db)
         .await;
+
+        if owns_run {
+            // Compute and update next_run_at from cron expression
+            let next_run = compute_next_run(&schedule_row.cron_expression);
+            let _ = sqlx::query(
+                "UPDATE backup_schedules SET last_run_at = NOW(), next_run_at = $2, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(schedule_row.id)
+            .bind(next_run)
+            .execute(db)
+            .await;
+        }
     }
 
     Ok(())
@@ -1243,6 +1400,7 @@ mod tests {
             backup_type: BackupType::Full,
             cron_expression: "0 2 * * *".to_string(),
             include_repositories: None,
+            due_at: Utc::now(),
         };
         assert_eq!(row.name, "nightly-backup");
         assert_eq!(row.cron_expression, "0 2 * * *");
@@ -1258,6 +1416,7 @@ mod tests {
             backup_type: BackupType::Incremental,
             cron_expression: "0 3 * * 0".to_string(),
             include_repositories: Some(repo_ids.clone()),
+            due_at: Utc::now(),
         };
         assert_eq!(row.include_repositories.as_ref().unwrap().len(), 2);
     }
@@ -1270,6 +1429,7 @@ mod tests {
             backup_type: BackupType::Metadata,
             cron_expression: "0 0 * * *".to_string(),
             include_repositories: None,
+            due_at: Utc::now(),
         };
         let debug_str = format!("{:?}", row);
         assert!(debug_str.contains("BackupScheduleRow"));
@@ -1351,5 +1511,122 @@ mod tests {
         let next = schedule.upcoming(Utc).next();
         assert!(next.is_some());
         assert!(next.unwrap() > Utc::now());
+    }
+
+    // -----------------------------------------------------------------------
+    // Backup schedule run claims (Tier-2: no-op without DATABASE_URL)
+    // -----------------------------------------------------------------------
+
+    async fn insert_test_backup_schedule(pool: &sqlx::PgPool) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO backup_schedules \
+                 (id, name, backup_type, cron_expression, storage_destination, is_enabled) \
+             VALUES ($1, $2, 'full', '0 2 * * *', '/tmp/backup-claim-test', true)",
+        )
+        .bind(id)
+        .bind(format!("claim-test-{}", &id.to_string()[..8]))
+        .execute(pool)
+        .await
+        .expect("insert backup schedule");
+        id
+    }
+
+    async fn cleanup_test_backup_schedule(pool: &sqlx::PgPool, schedule_id: uuid::Uuid) {
+        // backup_schedule_runs cascades from the schedule delete.
+        let _ = sqlx::query("DELETE FROM backup_schedules WHERE id = $1")
+            .bind(schedule_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// One (schedule, due-time) pair yields exactly one run: the second
+    /// claimer loses while the run is live, AND after the winner finalizes —
+    /// a completed occurrence is never re-executed.
+    #[tokio::test]
+    async fn backup_run_claim_is_exactly_once_per_due_time() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let schedule_id = insert_test_backup_schedule(&pool).await;
+        let due_at = Utc::now();
+
+        let winner = claim_backup_schedule_run(&pool, schedule_id, due_at, "replica-a", 3600.0)
+            .await
+            .expect("claim query ok")
+            .expect("first claim wins");
+
+        assert!(
+            claim_backup_schedule_run(&pool, schedule_id, due_at, "replica-b", 3600.0)
+                .await
+                .expect("claim query ok")
+                .is_none(),
+            "a live run claim must block other replicas"
+        );
+
+        // Winner records the outcome; the occurrence is now permanently done.
+        assert!(
+            finalize_backup_schedule_run(&pool, &winner, true, None, None).await,
+            "owner must be able to finalize its run"
+        );
+        assert!(
+            claim_backup_schedule_run(&pool, schedule_id, due_at, "replica-b", 3600.0)
+                .await
+                .expect("claim query ok")
+                .is_none(),
+            "a completed occurrence must never be re-claimed"
+        );
+
+        // A different due time is an independent occurrence.
+        let next_due = due_at + chrono::Duration::hours(24);
+        assert!(
+            claim_backup_schedule_run(&pool, schedule_id, next_due, "replica-b", 3600.0)
+                .await
+                .expect("claim query ok")
+                .is_some(),
+            "the next due time must be claimable"
+        );
+
+        cleanup_test_backup_schedule(&pool, schedule_id).await;
+    }
+
+    /// A crashed owner's expired 'running' claim is reclaimed in place, and
+    /// the stale owner can no longer finalize (so it cannot advance schedule
+    /// bookkeeping for a run it did not complete).
+    #[tokio::test]
+    async fn backup_run_expired_claim_reclaims_and_fences_stale_owner() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let schedule_id = insert_test_backup_schedule(&pool).await;
+        let due_at = Utc::now();
+
+        // Dead owner: claim born expired.
+        let stale = claim_backup_schedule_run(&pool, schedule_id, due_at, "replica-dead", -1.0)
+            .await
+            .expect("claim query ok")
+            .expect("claim");
+
+        // New owner reclaims the same occurrence in place.
+        let fresh = claim_backup_schedule_run(&pool, schedule_id, due_at, "replica-new", 3600.0)
+            .await
+            .expect("claim query ok")
+            .expect("expired running claim must be reclaimable");
+        assert_eq!(
+            stale.run_id, fresh.run_id,
+            "reclaim must reuse the same durable run row"
+        );
+
+        // Stale owner is fenced out of the finalize.
+        assert!(
+            !finalize_backup_schedule_run(&pool, &stale, true, None, None).await,
+            "stale owner must not finalize a re-claimed run"
+        );
+        // The rightful owner still can.
+        assert!(finalize_backup_schedule_run(&pool, &fresh, false, None, Some("boom")).await);
+
+        cleanup_test_backup_schedule(&pool, schedule_id).await;
     }
 }
