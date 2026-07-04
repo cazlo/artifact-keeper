@@ -163,16 +163,34 @@ pub fn spawn_all(
     }
 
     // Health monitoring (every 60 seconds)
+    //
+    // Singleton lease (cluster_work): without it every replica writes a
+    // health-log row per interval and the alert_state upsert advances
+    // consecutive_failures by replica count. Holding (not releasing) the
+    // lease pins the job to one healthy replica — the same owner renews on
+    // each 60s tick — while the 90s TTL hands the job over within ~30s of
+    // that replica dying.
     {
         let db = db.clone();
         let config_clone = config.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            let monitor = HealthMonitorService::new(db, MonitorConfig::default());
+            tokio::time::sleep(jittered_startup_delay(15)).await;
+            let monitor = HealthMonitorService::new(db.clone(), MonitorConfig::default());
             let mut ticker = interval(Duration::from_secs(60));
 
             loop {
                 ticker.tick().await;
+                let Some(_lease) =
+                    crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                        &db,
+                        "health_monitor",
+                        90.0,
+                    )
+                    .await
+                else {
+                    tracing::debug!("Another replica owns the health monitor lease; skipping");
+                    continue;
+                };
                 match monitor.check_all_services(&config_clone).await {
                     Ok(results) => {
                         for entry in &results {
@@ -195,17 +213,35 @@ pub fn spawn_all(
     }
 
     // Lifecycle policy execution (configurable check interval)
+    //
+    // Singleton lease (cluster_work): every replica evaluates the same due
+    // policies from last_run_at, so without coordination each due policy
+    // executes once per replica (duplicate soft-delete scans, metrics, and
+    // last_run bookkeeping). The lease is released after the tick — the
+    // fresh last_run_at then gates the next replica's is_policy_due check —
+    // and the 1h TTL bounds a crashed mid-execution holder.
     {
         let db = db.clone();
         let check_secs = config.lifecycle_check_interval_secs;
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            let service = LifecycleService::new(db);
+            tokio::time::sleep(jittered_startup_delay(60)).await;
+            let service = LifecycleService::new(db.clone());
             let mut ticker = interval(Duration::from_secs(check_secs));
 
             loop {
                 ticker.tick().await;
                 tracing::debug!("Checking for due lifecycle policies");
+
+                let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                    &db,
+                    "lifecycle_policy_execution",
+                    3600.0,
+                )
+                .await
+                else {
+                    tracing::debug!("Another replica owns the lifecycle lease; skipping tick");
+                    continue;
+                };
 
                 match service.execute_due_policies().await {
                     Ok(results) => {
@@ -225,6 +261,8 @@ pub fn spawn_all(
                         tracing::warn!("Lifecycle policy execution failed: {}", e);
                     }
                 }
+
+                lease.release(&db).await;
             }
         });
     }
@@ -562,19 +600,38 @@ pub fn spawn_all(
     }
 
     // Curation upstream metadata sync (checks every 5 minutes for repos due for sync)
+    //
+    // Singleton lease (cluster_work): every replica used to fetch and parse
+    // upstream metadata for every enabled staging repo on every tick,
+    // multiplying upstream HTTP load by replica count. The per-repo due
+    // check inside run_curation_sync_cycle additionally honors
+    // curation_sync_interval_secs via curation_last_synced_at.
     {
         let db = db.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(45)).await;
+            tokio::time::sleep(jittered_startup_delay(45)).await;
             let mut ticker = interval(Duration::from_secs(300));
 
             loop {
                 ticker.tick().await;
                 tracing::debug!("Checking for curation repos due for upstream sync");
 
+                let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                    &db,
+                    "curation_sync",
+                    1800.0,
+                )
+                .await
+                else {
+                    tracing::debug!("Another replica owns the curation sync lease; skipping");
+                    continue;
+                };
+
                 if let Err(e) = run_curation_sync_cycle(&db).await {
                     tracing::warn!("Curation sync cycle failed: {}", e);
                 }
+
+                lease.release(&db).await;
             }
         });
     }
@@ -1061,7 +1118,11 @@ async fn run_curation_sync_cycle(
     use crate::services::curation_service::CurationService;
     use crate::services::curation_sync;
 
-    // Find repos due for sync
+    // Find repos due for sync. `curation_sync_interval_secs` is honored via
+    // `curation_last_synced_at` (previously the interval was read but
+    // ignored, so every enabled repo re-fetched upstream metadata on every
+    // 5-minute tick). The 60s floor keeps a misconfigured interval from
+    // turning the scheduler tick into a hot loop against the upstream.
     let repos: Vec<(uuid::Uuid, String, uuid::Uuid, String, String, i32)> = sqlx::query_as(
         r#"SELECT r.id, r.format::text, r.curation_source_repo_id, remote.upstream_url,
                   r.curation_default_action, r.curation_sync_interval_secs
@@ -1070,7 +1131,13 @@ async fn run_curation_sync_cycle(
            WHERE r.curation_enabled = true
              AND r.curation_source_repo_id IS NOT NULL
              AND r.repo_type = 'staging'
-             AND remote.upstream_url IS NOT NULL"#,
+             AND remote.upstream_url IS NOT NULL
+             AND (
+                r.curation_last_synced_at IS NULL
+                OR r.curation_last_synced_at
+                   + make_interval(secs => GREATEST(r.curation_sync_interval_secs, 60)::double precision)
+                   <= NOW()
+             )"#,
     )
     .fetch_all(db)
     .await?;
@@ -1240,6 +1307,15 @@ async fn run_curation_sync_cycle(
                 }
             }
         }
+
+        // Successful fetch+evaluate: stamp the bookkeeping so this repo is
+        // not due again until its configured interval elapses. Failed
+        // fetches `continue` above without stamping and retry next tick.
+        let _ =
+            sqlx::query("UPDATE repositories SET curation_last_synced_at = NOW() WHERE id = $1")
+                .bind(staging_id)
+                .execute(db)
+                .await;
     }
 
     Ok(())
