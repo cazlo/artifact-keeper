@@ -282,12 +282,34 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                             tokio::spawn(async move {
                                 match svc.is_index_empty().await {
                                     Ok(true) => {
+                                        // Singleton lease (cluster_work): on a
+                                        // fresh multi-replica deployment every
+                                        // replica sees an empty index and would
+                                        // otherwise start its own full reindex.
+                                        // The 6h TTL covers large instances;
+                                        // release on completion lets a retry
+                                        // happen (via the admin endpoint or a
+                                        // restart) without waiting out the TTL.
+                                        let Some(lease) =
+                                            artifact_keeper_backend::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                                                &pool,
+                                                "opensearch_bootstrap_reindex",
+                                                6.0 * 3600.0,
+                                            )
+                                            .await
+                                        else {
+                                            tracing::info!(
+                                                "OpenSearch index is empty but another replica owns the bootstrap reindex; skipping"
+                                            );
+                                            return;
+                                        };
                                         tracing::info!(
                                             "OpenSearch index is empty, starting background reindex"
                                         );
                                         if let Err(e) = svc.full_reindex(&pool).await {
                                             tracing::error!("Background reindex failed: {}", e);
                                         }
+                                        lease.release(&pool).await;
                                     }
                                     Ok(false) => {
                                         tracing::info!(
