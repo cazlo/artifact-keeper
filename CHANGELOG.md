@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Webhook retry deliveries are claimed atomically before the re-POST** (#2219): with multiple backend replicas sharing one database, every replica's retry tick selected the same due deliveries, so one failed delivery could be re-POSTed once per replica per tick — and exhausting `max_attempts` could fire the dead-letter auto-disable notifier once per replica. Due deliveries are now claimed in a single `FOR UPDATE SKIP LOCKED` statement with a per-claim token (the same `cluster_work` pattern as the #2275 sync-task claim), the claim is re-extended immediately before each send, and success/retry/dead-letter updates are token-guarded so a stale owner cannot clobber a re-claimed delivery. A crashed replica's claim simply expires, making the delivery due again with no operator action.
+
 ### Security
 
 - **PyPI virtual repositories now isolate locally-owned project names by default (PEP 708 dependency-confusion mitigation)** (#1600). Previously, when a local member owned a project name, a virtual repo could union an unrelated upstream package of the same name into its `/simple/` index and serve it on download, so an unpinned `pip install <name>` could resolve to the higher public version (a supply-chain hole). A PyPI virtual now serves only the owning member's distributions for a locally-owned name, in both the simple index and the download, unless an operator declares a PEP 708 `tracks` relationship for that project. The Simple API now advertises v1.2 and emits `meta.tracks` / `pypi:tracks` where declared.
