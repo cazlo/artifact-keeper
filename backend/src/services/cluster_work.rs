@@ -38,8 +38,11 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::future::Future;
 use std::ops::Deref;
 use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -167,6 +170,73 @@ impl<T> Deref for Claimed<T> {
 // Singleton scheduler leases
 // ---------------------------------------------------------------------------
 
+/// Background heartbeat for a durable claim/lease.
+///
+/// Dropping the guard aborts the heartbeat task. The underlying claim is not
+/// released by this guard; callers still finalize or release through their
+/// token-guarded table-specific path.
+#[derive(Debug)]
+pub struct RenewalGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RenewalGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn renewal_interval(ttl_secs: f64) -> Duration {
+    let ttl_secs = if ttl_secs.is_finite() && ttl_secs > 0.0 {
+        ttl_secs
+    } else {
+        1.0
+    };
+    Duration::from_secs_f64((ttl_secs / 3.0).clamp(5.0, 300.0))
+}
+
+/// Spawn a best-effort renewal loop for a durable claim.
+///
+/// The closure must perform a token-guarded renewal and return:
+/// * `Ok(true)` when the owner still holds the claim;
+/// * `Ok(false)` when the claim was lost and the heartbeat should stop;
+/// * `Err(message)` for transient renewal failures, which are logged and
+///   retried until either renewal succeeds, the claim is lost, or the guard
+///   is dropped.
+pub fn spawn_renewal_loop<F, Fut>(
+    label: impl Into<String>,
+    ttl_secs: f64,
+    mut renew: F,
+) -> RenewalGuard
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = std::result::Result<bool, String>> + Send + 'static,
+{
+    let label = label.into();
+    let every = renewal_interval(ttl_secs);
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(every);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+            match renew().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(claim = %label, "claim renewal stopped because ownership was lost");
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(claim = %label, error = %e, "claim renewal failed; will retry");
+                }
+            }
+        }
+    });
+
+    RenewalGuard { handle }
+}
+
 /// A held (or renewed) singleton job lease from `scheduler_leases`.
 ///
 /// Unlike [`crate::services::cluster_lock::ClusterLease`] this is durable
@@ -186,26 +256,31 @@ impl SchedulerLease {
         self.lease_expires_at
     }
 
+    /// Keep this scheduler lease alive until the returned guard is dropped.
+    ///
+    /// This is for singleton jobs whose side effects may run longer than one
+    /// fixed TTL (large lifecycle cycles, curation syncs, bootstrap reindexes).
+    pub fn spawn_renewal(&self, db: PgPool, ttl_secs: f64) -> RenewalGuard {
+        let job_name = self.job_name.clone();
+        let claim_token = self.claim_token;
+        spawn_renewal_loop(format!("scheduler lease {job_name}"), ttl_secs, move || {
+            let db = db.clone();
+            let job_name = job_name.clone();
+            async move {
+                renew_scheduler_lease_by_token(&db, &job_name, claim_token, ttl_secs)
+                    .await
+                    .map(|expires| expires.is_some())
+                    .map_err(|e| e.to_string())
+            }
+        })
+    }
+
     /// Extend the lease by `ttl_secs` from now. Returns `false` (and stops
     /// being the holder) if the lease was lost — expired and re-claimed by
     /// another replica — in which case the caller should stop side effects.
     pub async fn renew(&mut self, db: &PgPool, ttl_secs: f64) -> Result<bool> {
-        let renewed: Option<DateTime<Utc>> = sqlx::query_scalar(
-            r#"
-            UPDATE scheduler_leases
-            SET lease_expires_at = NOW() + make_interval(secs => $3),
-                updated_at = NOW()
-            WHERE job_name = $1
-              AND claim_token = $2
-            RETURNING lease_expires_at
-            "#,
-        )
-        .bind(&self.job_name)
-        .bind(self.claim_token)
-        .bind(ttl_secs)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let renewed =
+            renew_scheduler_lease_by_token(db, &self.job_name, self.claim_token, ttl_secs).await?;
 
         match renewed {
             Some(expires) => {
@@ -237,6 +312,30 @@ impl SchedulerLease {
             tracing::debug!(job = %self.job_name, error = %e, "scheduler lease release failed");
         }
     }
+}
+
+async fn renew_scheduler_lease_by_token(
+    db: &PgPool,
+    job_name: &str,
+    claim_token: Uuid,
+    ttl_secs: f64,
+) -> Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar(
+        r#"
+        UPDATE scheduler_leases
+        SET lease_expires_at = NOW() + make_interval(secs => $3),
+            updated_at = NOW()
+        WHERE job_name = $1
+          AND claim_token = $2
+        RETURNING lease_expires_at
+        "#,
+    )
+    .bind(job_name)
+    .bind(claim_token)
+    .bind(ttl_secs)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Try to claim the named singleton job lease for `ttl_secs`.
@@ -327,6 +426,13 @@ mod tests {
         let a = WorkerIdentity::for_process().as_str().to_string();
         let b = WorkerIdentity::for_process().as_str().to_string();
         assert_eq!(a, b, "identity must be stable for the process lifetime");
+    }
+
+    #[test]
+    fn renewal_interval_is_bounded() {
+        assert_eq!(renewal_interval(0.0), Duration::from_secs(5));
+        assert_eq!(renewal_interval(90.0), Duration::from_secs(30));
+        assert_eq!(renewal_interval(6.0 * 3600.0), Duration::from_secs(300));
     }
 
     #[test]

@@ -23,6 +23,9 @@ use crate::services::smtp_service::SmtpService;
 use crate::services::storage_service::StorageService;
 use crate::services::sync_policy_service::SyncPolicyService;
 
+const LIFECYCLE_LEASE_TTL_SECS: f64 = 3600.0;
+const CURATION_SYNC_LEASE_TTL_SECS: f64 = 1800.0;
+
 /// Database gauge stats for Prometheus metrics.
 #[derive(Debug, sqlx::FromRow)]
 struct GaugeStats {
@@ -235,13 +238,14 @@ pub fn spawn_all(
                 let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
                     &db,
                     "lifecycle_policy_execution",
-                    3600.0,
+                    LIFECYCLE_LEASE_TTL_SECS,
                 )
                 .await
                 else {
                     tracing::debug!("Another replica owns the lifecycle lease; skipping tick");
                     continue;
                 };
+                let lease_renewal = lease.spawn_renewal(db.clone(), LIFECYCLE_LEASE_TTL_SECS);
 
                 match service.execute_due_policies().await {
                     Ok(results) => {
@@ -262,6 +266,7 @@ pub fn spawn_all(
                     }
                 }
 
+                drop(lease_renewal);
                 lease.release(&db).await;
             }
         });
@@ -619,18 +624,20 @@ pub fn spawn_all(
                 let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
                     &db,
                     "curation_sync",
-                    1800.0,
+                    CURATION_SYNC_LEASE_TTL_SECS,
                 )
                 .await
                 else {
                     tracing::debug!("Another replica owns the curation sync lease; skipping");
                     continue;
                 };
+                let lease_renewal = lease.spawn_renewal(db.clone(), CURATION_SYNC_LEASE_TTL_SECS);
 
                 if let Err(e) = run_curation_sync_cycle(&db).await {
                     tracing::warn!("Curation sync cycle failed: {}", e);
                 }
 
+                drop(lease_renewal);
                 lease.release(&db).await;
             }
         });
@@ -814,6 +821,7 @@ struct BackupScheduleRow {
 const BACKUP_RUN_CLAIM_TTL_SECS: f64 = 6.0 * 3600.0;
 
 /// Proof that this process owns one `backup_schedule_runs` row.
+#[derive(Clone, Copy)]
 struct BackupRunClaim {
     run_id: uuid::Uuid,
     claim_token: uuid::Uuid,
@@ -860,6 +868,51 @@ async fn claim_backup_schedule_run(
         run_id,
         claim_token,
     }))
+}
+
+/// Extend a live backup run claim. Returns `false` when the token no longer
+/// owns the run (expired and re-claimed, or already terminal).
+async fn renew_backup_schedule_run_claim(
+    db: &PgPool,
+    claim: &BackupRunClaim,
+    claim_ttl_secs: f64,
+) -> crate::error::Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE backup_schedule_runs
+        SET claim_expires_at = NOW() + make_interval(secs => $3)
+        WHERE id = $1
+          AND claim_token = $2
+          AND status = 'running'
+        "#,
+    )
+    .bind(claim.run_id)
+    .bind(claim.claim_token)
+    .bind(claim_ttl_secs)
+    .execute(db)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+    Ok(result.rows_affected() == 1)
+}
+
+fn spawn_backup_run_renewal(
+    db: PgPool,
+    claim: BackupRunClaim,
+    claim_ttl_secs: f64,
+) -> crate::services::cluster_work::RenewalGuard {
+    crate::services::cluster_work::spawn_renewal_loop(
+        format!("backup schedule run {}", claim.run_id),
+        claim_ttl_secs,
+        move || {
+            let db = db.clone();
+            async move {
+                renew_backup_schedule_run_claim(&db, &claim, claim_ttl_secs)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+    )
 }
 
 /// Record the run outcome, token-guarded. Returns `true` when this process
@@ -981,6 +1034,7 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
         );
 
         let service = BackupService::new(db.clone(), storage.clone());
+        let run_renewal = spawn_backup_run_renewal(db.clone(), claim, BACKUP_RUN_CLAIM_TTL_SECS);
 
         // Create and execute the backup
         let create_result = service
@@ -1041,6 +1095,7 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
             error_message.as_deref(),
         )
         .await;
+        drop(run_renewal);
 
         if owns_run {
             // Compute and update next_run_at from cron expression
@@ -1702,6 +1757,66 @@ mod tests {
         );
         // The rightful owner still can.
         assert!(finalize_backup_schedule_run(&pool, &fresh, false, None, Some("boom")).await);
+
+        cleanup_test_backup_schedule(&pool, schedule_id).await;
+    }
+
+    /// A live owner can renew an otherwise-expired run before another replica
+    /// reclaims it; after a real reclaim, the stale token can no longer renew.
+    #[tokio::test]
+    async fn backup_run_claim_renewal_blocks_reclaim_and_fences_stale_owner() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let schedule_id = insert_test_backup_schedule(&pool).await;
+        let due_at = Utc::now();
+
+        let owner = claim_backup_schedule_run(&pool, schedule_id, due_at, "replica-a", -1.0)
+            .await
+            .expect("claim query ok")
+            .expect("claim");
+
+        assert!(
+            renew_backup_schedule_run_claim(&pool, &owner, 3600.0)
+                .await
+                .expect("renew query ok"),
+            "the live owner must be able to extend its own token"
+        );
+        assert!(
+            claim_backup_schedule_run(&pool, schedule_id, due_at, "replica-b", 3600.0)
+                .await
+                .expect("claim query ok")
+                .is_none(),
+            "a renewed run must not be claimable by another replica"
+        );
+
+        sqlx::query(
+            "UPDATE backup_schedule_runs \
+             SET claim_expires_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(owner.run_id)
+        .execute(&pool)
+        .await
+        .expect("expire renewed claim");
+
+        let new_owner = claim_backup_schedule_run(&pool, schedule_id, due_at, "replica-b", 3600.0)
+            .await
+            .expect("claim query ok")
+            .expect("expired running claim must be reclaimable");
+
+        assert!(
+            !renew_backup_schedule_run_claim(&pool, &owner, 3600.0)
+                .await
+                .expect("renew query ok"),
+            "a stale token must not renew after the run is re-claimed"
+        );
+        assert!(
+            renew_backup_schedule_run_claim(&pool, &new_owner, 3600.0)
+                .await
+                .expect("renew query ok"),
+            "the new owner must be able to renew"
+        );
 
         cleanup_test_backup_schedule(&pool, schedule_id).await;
     }
