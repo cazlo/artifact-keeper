@@ -603,7 +603,14 @@ async fn complete(
     let user_id = auth.user_id;
     let is_replication_request = super::is_replication_request(&headers);
 
-    // C3: Verify user owns this session
+    // C3: Verify user owns this session.
+    //
+    // complete_session takes the completion lease (pending/in_progress ->
+    // 'committing' with a state token) before verifying chunks/size/checksum,
+    // so a duplicate complete request — even one routed to another replica —
+    // gets a conflict here instead of a second storage copy + artifact
+    // upsert. Everything below runs under that lease and the terminal
+    // transition is token-guarded.
     let session = UploadService::complete_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
@@ -623,23 +630,36 @@ async fn complete(
         &session.checksum_sha256,
     );
 
-    let repo = crate::services::repository_service::RepositoryService::new(state.db.clone())
+    let repo = match crate::services::repository_service::RepositoryService::new(state.db.clone())
         .get_by_id(session.repository_id)
         .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    {
+        Ok(repo) => repo,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+    let storage = match state.storage_for_repo(&repo.storage_location()) {
+        Ok(storage) => storage,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
 
     let temp_path = std::path::PathBuf::from(&session.temp_file_path);
 
     // C1: Use put_file to stream from disk instead of reading the entire file
     // into memory. The default implementation still reads into memory, but
     // backends can override for true streaming (S3 multipart, etc.).
-    storage
-        .put_file(&storage_key, &temp_path)
-        .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    //
+    // A storage failure is retryable — the temp file is still on disk — so
+    // release the commit lease and let the client re-issue the complete.
+    if let Err(e) = storage.put_file(&storage_key, &temp_path).await {
+        UploadService::release_commit_lease(&state.db, &session).await;
+        return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
 
     // Clean up temp file
     let _ = tokio::fs::remove_file(&temp_path).await;
@@ -657,7 +677,7 @@ async fn complete(
     // repositories keep their existing behaviour (version may be NULL).
     let derived_version = completed_format_artifact_version(&session, &repo.format);
     let artifact_version = derived_version.as_deref();
-    let artifact_id: Uuid = sqlx::query_scalar(
+    let artifact_id: Uuid = match sqlx::query_scalar(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
                                checksum_sha256, content_type, storage_key, uploaded_by)
@@ -680,7 +700,20 @@ async fn complete(
     .bind(user_id)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    {
+        Ok(id) => id,
+        Err(e) => {
+            // The temp file was already removed after the storage copy, so a
+            // retry cannot re-verify the payload: terminal failure.
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("artifact upsert failed: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
 
     if let (Some(format), Some(metadata)) = (
         session.artifact_metadata_format.as_deref(),
@@ -691,10 +724,18 @@ async fn complete(
             .clone()
             .unwrap_or_else(|| serde_json::json!({}));
         let artifact_service = state.create_artifact_service(storage.clone());
-        artifact_service
+        if let Err(e) = artifact_service
             .set_metadata(artifact_id, format, metadata, properties)
             .await
-            .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        {
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("artifact metadata write failed: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
     }
 
     if let Some((package_name, package_version)) = completed_package_catalog_entry(&session) {
@@ -709,6 +750,28 @@ async fn complete(
                 completed_package_metadata(&session),
             )
             .await;
+    }
+
+    // Terminal transition, token-guarded. A lost lease here means the commit
+    // took longer than the 6h staleness window and a newer complete request
+    // reclaimed the session — the artifact upsert above is idempotent, so
+    // the only consequence is that the newer owner also finalizes.
+    match UploadService::finalize_completed(&state.db, &session).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                session = %session_id,
+                "chunked upload finalized but its completion lease was lost; \
+                 a newer complete request owns the session"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                session = %session_id,
+                error = %e,
+                "failed to mark upload session completed"
+            );
+        }
     }
 
     tracing::info!(
@@ -1379,6 +1442,8 @@ mod tests {
             temp_file_path: "/tmp/upload-session".to_string(),
             status: "completed".to_string(),
             error_message: None,
+            state_token: None,
+            committing_expires_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
