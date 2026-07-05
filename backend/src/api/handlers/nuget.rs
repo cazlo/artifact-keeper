@@ -30,6 +30,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::age_gate_service::{AgeGateDecision, AgeGateMode, AgeGateService};
 use crate::services::auth_service::AuthService;
 use crate::services::curation_service::version_compare;
 
@@ -78,6 +79,111 @@ async fn resolve_nuget_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
         "a NuGet",
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Age gate (remote repos; issue #1558 format expansion — first_seen mode).
+//
+// NuGet is the first consumer of the cross-cutting `first_seen` age source:
+// the cooldown starts when this server first observes a version (listing or
+// direct download), not at a registry publish time. The flat-container index
+// is what clients use for version discovery/resolution, so it is filtered
+// alongside the registration index's INLINE pages; externally referenced
+// registration pages point at the upstream registry and cannot be filtered —
+// the download gate below still holds for anything discovered through them.
+// ---------------------------------------------------------------------------
+
+/// Filter a flat-container version list (upstream document or locally built
+/// list) through the age gate. No-op when the gate does not apply.
+async fn apply_nuget_versions_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_id_lower: &str,
+    versions: &mut Vec<String>,
+) -> Result<(), Response> {
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return Ok(());
+    };
+    let params = proxy_helpers::age_gate_params_resolved(&state.db, repo).await?;
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(());
+    }
+    svc.filter_nuget_version_list(&params, package_id_lower, versions)
+        .await
+        .map_err(|e| e.into_response())
+}
+
+/// Filter a registration index document (upstream pass-through or locally
+/// built) through the age gate. No-op when the gate does not apply.
+async fn apply_nuget_registration_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_id_lower: &str,
+    doc: &mut serde_json::Value,
+) -> Result<(), Response> {
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return Ok(());
+    };
+    let params = proxy_helpers::age_gate_params_resolved(&state.db, repo).await?;
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(());
+    }
+    svc.filter_nuget_registration_index(&params, package_id_lower, doc)
+        .await
+        .map_err(|e| e.into_response())
+}
+
+/// Age-gate one package version on the flat-container download path. Runs
+/// before the artifact lookup so neither the local cache nor the upstream
+/// refetch can serve a blocked version. In `first_seen` mode the download
+/// itself records the observation, so a version fetched without ever being
+/// listed still starts its cooldown at first contact.
+///
+/// No last-known-good substitution: NuGet clients verify package content
+/// hashes, so a block is always a structured 451.
+async fn apply_nuget_download_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_id_lower: &str,
+    version: &str,
+) -> Result<(), Response> {
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return Ok(());
+    };
+    let params = proxy_helpers::age_gate_params_resolved(&state.db, repo).await?;
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(());
+    }
+
+    let normalized = crate::services::age_gate_service::normalize_nuget_version(version);
+    let published_at = match params.age_gate_mode {
+        AgeGateMode::FirstSeen => svc
+            .first_seen_time(repo.id, package_id_lower, &normalized)
+            .await
+            .map_err(|e| e.into_response())?,
+        // No publish-time source is wired for NuGet; is_applicable() keeps
+        // this arm unreachable, and a timeless check fails closed regardless.
+        AgeGateMode::UpstreamPublishTime => None,
+    };
+
+    match svc
+        .check(&params, package_id_lower, &normalized, published_at)
+        .await
+        .map_err(|e| e.into_response())?
+    {
+        AgeGateDecision::Allow => Ok(()),
+        AgeGateDecision::Block { review_id, .. } => {
+            let requested_age_days =
+                published_at.map(|p| AgeGateService::package_age_days(p, chrono::Utc::now()));
+            Err(proxy_helpers::age_gate_blocked_response(
+                review_id,
+                package_id_lower,
+                &normalized,
+                params.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
 }
 
 /// Resolve the set of repository IDs whose local `artifacts` rows should back
@@ -409,18 +515,30 @@ async fn registration_index(
                     proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await?;
+                let content_type = content_type.unwrap_or_else(|| "application/json".to_string());
+                // Age gate: filter inline registration pages before serving.
+                // Documents that don't parse as JSON pass through unchanged
+                // (nothing version-shaped to withhold; downloads stay gated).
+                if let Ok(mut doc) = serde_json::from_slice::<serde_json::Value>(&content) {
+                    apply_nuget_registration_age_gate(&state, &repo, &package_id_lower, &mut doc)
+                        .await?;
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, content_type)
+                        .body(Body::from(serde_json::to_string(&doc).unwrap()))
+                        .unwrap());
+                }
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/json".to_string()),
-                    )
+                    .header(CONTENT_TYPE, content_type)
                     .body(Body::from(content))
                     .unwrap());
             }
         }
 
         // Virtual repo: try each remote member's upstream in priority order.
+        // (Virtual repos keep the unfiltered pass-through — documented v1
+        // age-gate limitation, same as npm/PyPI.)
         if repo.repo_type == RepositoryType::Virtual {
             if let Some(proxy) = &state.proxy_service {
                 for member in &members {
@@ -504,7 +622,7 @@ async fn registration_index(
         .and_then(|a| a.version.as_deref())
         .unwrap_or("0.0.0");
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "@id": format!("{}/v3/registration/{}/index.json", base, package_id_lower),
         "count": 1,
         "items": [
@@ -517,6 +635,10 @@ async fn registration_index(
             }
         ]
     });
+
+    // Locally cached versions of a Remote repo are still upstream content:
+    // filter the built registration document through the age gate too.
+    apply_nuget_registration_age_gate(&state, &repo, &package_id_lower, &mut response).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -580,18 +702,42 @@ async fn flatcontainer_versions(
                     proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await?;
+                let content_type = content_type.unwrap_or_else(|| "application/json".to_string());
+                // Age gate: the flat-container index is the version-discovery
+                // document NuGet clients resolve against — filter it before
+                // serving. Unparseable documents pass through unchanged.
+                if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&content) {
+                    if let Some(arr) = doc.get("versions").and_then(|v| v.as_array()) {
+                        let mut upstream_versions: Vec<String> = arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect();
+                        apply_nuget_versions_age_gate(
+                            &state,
+                            &repo,
+                            &package_id_lower,
+                            &mut upstream_versions,
+                        )
+                        .await?;
+                        let filtered = serde_json::json!({ "versions": upstream_versions });
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, content_type)
+                            .body(Body::from(serde_json::to_string(&filtered).unwrap()))
+                            .unwrap());
+                    }
+                }
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/json".to_string()),
-                    )
+                    .header(CONTENT_TYPE, content_type)
                     .body(Body::from(content))
                     .unwrap());
             }
         }
 
         // Virtual repo: try each remote member's upstream in priority order.
+        // (Virtual repos keep the unfiltered pass-through — documented v1
+        // age-gate limitation, same as npm/PyPI.)
         if repo.repo_type == RepositoryType::Virtual {
             if let Some(proxy) = &state.proxy_service {
                 for member in &members {
@@ -627,6 +773,10 @@ async fn flatcontainer_versions(
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
+    // Locally cached versions of a Remote repo are still upstream content:
+    // filter the built list through the age gate too.
+    apply_nuget_versions_age_gate(&state, &repo, &package_id_lower, &mut versions).await?;
+
     let response = serde_json::json!({
         "versions": versions
     });
@@ -648,6 +798,11 @@ async fn flatcontainer_download(
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
+
+    // Age gate before the artifact lookup: covers both the local-cache and
+    // the upstream-refetch serving paths (also gates the .nuspec, which
+    // shares this route).
+    apply_nuget_download_age_gate(&state, &repo, &package_id_lower, &version).await?;
 
     // Find the artifact matching this package/version.
     let artifact = sqlx::query!(
