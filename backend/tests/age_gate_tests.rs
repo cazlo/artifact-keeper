@@ -6,7 +6,7 @@
 
 use artifact_keeper_backend::models::repository::{RepositoryFormat, RepositoryType};
 use artifact_keeper_backend::services::age_gate_service::{
-    AgeGateDecision, AgeGateRepoParams, AgeGateService, AUTO_APPROVE_REASON,
+    AgeGateDecision, AgeGateMode, AgeGateRepoParams, AgeGateService, AUTO_APPROVE_REASON,
 };
 use artifact_keeper_backend::services::event_bus::EventBus;
 use chrono::{DateTime, Duration, Utc};
@@ -646,4 +646,375 @@ async fn npm_packument_withholds_young_keeps_old_and_reconciles_tags() {
         "pending",
         "the withheld young version must be queued for review"
     );
+}
+
+// ---------------------------------------------------------------------------
+// first_seen mode + format expansion (Go, NuGet)
+// ---------------------------------------------------------------------------
+
+async fn create_remote_repo_with_mode(
+    pool: &PgPool,
+    suffix: &str,
+    format: &str,
+    upstream_url: &str,
+    min_age_days: i32,
+    mode: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let key = format!("age-gate-{format}-{suffix}-{id}");
+    sqlx::query(
+        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, age_gate_enabled, age_gate_min_age_days, age_gate_mode)
+         VALUES ($1, $2, $2, $3, 'remote', $4::repository_format, $5, true, $6, $7)",
+    )
+    .bind(id)
+    .bind(&key)
+    .bind(format!("/tmp/test-artifacts/{id}"))
+    .bind(format)
+    .bind(upstream_url)
+    .bind(min_age_days)
+    .bind(mode)
+    .execute(pool)
+    .await
+    .expect("insert repo with mode");
+    id
+}
+
+fn repo_params_with_mode(
+    id: Uuid,
+    key: &str,
+    format: RepositoryFormat,
+    min_age_days: i32,
+    mode: AgeGateMode,
+) -> AgeGateRepoParams {
+    AgeGateRepoParams::from_parts(id, key, RepositoryType::Remote, format, true, min_age_days)
+        .with_mode(mode)
+}
+
+/// Backdate a first-seen observation so a "locally aged" version can be
+/// simulated without waiting out a real cooldown.
+async fn backdate_observation(
+    pool: &PgPool,
+    repo_id: Uuid,
+    package: &str,
+    version: &str,
+    days: i64,
+) {
+    sqlx::query(
+        "UPDATE age_gate_version_observations
+         SET first_seen_at = NOW() - make_interval(days => $4::int)
+         WHERE repository_id = $1 AND package_name = $2 AND package_version = $3",
+    )
+    .bind(repo_id)
+    .bind(package)
+    .bind(version)
+    .bind(days as i32)
+    .execute(pool)
+    .await
+    .expect("backdate observation");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn first_seen_observation_is_stable_and_concurrency_safe() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+    let repo_id = create_remote_repo_with_mode(
+        &pool,
+        "obs",
+        "nuget",
+        "https://api.nuget.org/v3",
+        7,
+        "first_seen",
+    )
+    .await;
+
+    let versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+    let first = svc
+        .observe_versions_first_seen(repo_id, "demo", &versions)
+        .await
+        .expect("first observation");
+    assert_eq!(first.len(), 2, "both versions observed");
+
+    // Concurrent re-observations must neither error nor move the timestamps.
+    let (a, b, c, d) = tokio::join!(
+        svc.observe_versions_first_seen(repo_id, "demo", &versions),
+        svc.observe_versions_first_seen(repo_id, "demo", &versions),
+        svc.observe_versions_first_seen(repo_id, "demo", &versions),
+        svc.observe_versions_first_seen(repo_id, "demo", &versions),
+    );
+    for map in [
+        a.expect("concurrent observe"),
+        b.expect("concurrent observe"),
+        c.expect("concurrent observe"),
+        d.expect("concurrent observe"),
+    ] {
+        assert_eq!(
+            map, first,
+            "first_seen_at must be stable across observations"
+        );
+    }
+
+    let row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM age_gate_version_observations
+         WHERE repository_id = $1 AND package_name = 'demo'",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count observations");
+    assert_eq!(row_count, 2, "exactly one row per version");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn nuget_first_seen_blocks_until_local_age_crosses_threshold() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+    let repo_id = create_remote_repo_with_mode(
+        &pool,
+        "flat",
+        "nuget",
+        "https://api.nuget.org/v3",
+        7,
+        "first_seen",
+    )
+    .await;
+    let params = repo_params_with_mode(
+        repo_id,
+        "age-gate-nuget-flat",
+        RepositoryFormat::Nuget,
+        7,
+        AgeGateMode::FirstSeen,
+    );
+    let pkg = "contoso.widgets";
+
+    // First sight: every version is young by definition and must be withheld.
+    let mut versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+    svc.filter_nuget_version_list(&params, pkg, &mut versions)
+        .await
+        .expect("filter flatcontainer versions");
+    assert!(
+        versions.is_empty(),
+        "first-seen versions are all young; got {versions:?}"
+    );
+    assert_eq!(review_status(&pool, repo_id, pkg, "1.0.0").await, "pending");
+    assert_eq!(review_status(&pool, repo_id, pkg, "2.0.0").await, "pending");
+
+    // Locally age one version past the threshold.
+    backdate_observation(&pool, repo_id, pkg, "1.0.0", 10).await;
+
+    let mut versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+    svc.filter_nuget_version_list(&params, pkg, &mut versions)
+        .await
+        .expect("filter after backdate");
+    assert_eq!(
+        versions,
+        vec!["1.0.0".to_string()],
+        "locally aged version serves, the fresh one stays withheld"
+    );
+
+    // Download-path agreement: check() with the first_seen time decides the
+    // same way the listing did.
+    let aged_time = svc
+        .first_seen_time(repo_id, pkg, "1.0.0")
+        .await
+        .expect("first_seen_time");
+    assert!(matches!(
+        svc.check(&params, pkg, "1.0.0", aged_time)
+            .await
+            .expect("check aged"),
+        AgeGateDecision::Allow
+    ));
+    let fresh_time = svc
+        .first_seen_time(repo_id, pkg, "2.0.0")
+        .await
+        .expect("first_seen_time fresh");
+    assert!(matches!(
+        svc.check(&params, pkg, "2.0.0", fresh_time)
+            .await
+            .expect("check fresh"),
+        AgeGateDecision::Block { .. }
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn nuget_registration_inline_pages_filtered_by_first_seen() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+    let repo_id = create_remote_repo_with_mode(
+        &pool,
+        "reg",
+        "nuget",
+        "https://api.nuget.org/v3",
+        7,
+        "first_seen",
+    )
+    .await;
+    let params = repo_params_with_mode(
+        repo_id,
+        "age-gate-nuget-reg",
+        RepositoryFormat::Nuget,
+        7,
+        AgeGateMode::FirstSeen,
+    );
+    let pkg = "contoso.registration";
+
+    // Pre-observe and locally age 1.0.0; 2.0.0 is first seen by the filter.
+    svc.observe_versions_first_seen(repo_id, pkg, &["1.0.0".to_string()])
+        .await
+        .expect("pre-observe");
+    backdate_observation(&pool, repo_id, pkg, "1.0.0", 10).await;
+
+    let mut doc = serde_json::json!({
+        "@id": "reg-index",
+        "count": 2,
+        "items": [
+            {
+                "@id": "page0",
+                "count": 2,
+                "lower": "1.0.0",
+                "upper": "2.0.0",
+                "items": [
+                    { "catalogEntry": { "id": pkg, "version": "1.0.0" } },
+                    { "catalogEntry": { "id": pkg, "version": "2.0.0" } },
+                ],
+            },
+            { "@id": "https://upstream.example/page1", "count": 64,
+              "lower": "3.0.0", "upper": "4.0.0" },
+        ],
+    });
+
+    svc.filter_nuget_registration_index(&params, pkg, &mut doc)
+        .await
+        .expect("filter registration index");
+
+    let page0 = &doc["items"][0];
+    let remaining: Vec<&str> = page0["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["catalogEntry"]["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(remaining, vec!["1.0.0"], "young inline item withheld");
+    assert_eq!(page0["count"], serde_json::json!(1));
+    assert_eq!(page0["upper"], serde_json::json!("1.0.0"));
+    assert_eq!(
+        doc["items"][1]["@id"],
+        serde_json::json!("https://upstream.example/page1"),
+        "external page reference untouched"
+    );
+    assert_eq!(review_status(&pool, repo_id, pkg, "2.0.0").await, "pending");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn go_version_list_filters_on_upstream_info_times() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+
+    // Upstream GOPROXY double: v1.0.0 is old, v2.0.0 is young, v3.0.0 has no
+    // .info (fetch fails -> timeless -> withheld, fail-closed).
+    let server = MockServer::start().await;
+    let old = (Utc::now() - Duration::days(3650)).to_rfc3339();
+    let young = (Utc::now() - Duration::days(1)).to_rfc3339();
+    Mock::given(method("GET"))
+        .and(wm_path("/example.com/mod/@v/v1.0.0.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Version": "v1.0.0", "Time": old
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wm_path("/example.com/mod/@v/v2.0.0.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Version": "v2.0.0", "Time": young
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wm_path("/example.com/mod/@v/v3.0.0.info"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let repo_id = create_remote_repo_with_mode(
+        &pool,
+        "list",
+        "go",
+        &server.uri(),
+        7,
+        "upstream_publish_time",
+    )
+    .await;
+    let params = repo_params_with_mode(
+        repo_id,
+        "age-gate-go-list",
+        RepositoryFormat::Go,
+        7,
+        AgeGateMode::UpstreamPublishTime,
+    );
+    let module = "example.com/mod";
+
+    let filtered = svc
+        .filter_go_version_list(
+            &params,
+            module,
+            module, // no capitals: encoded == decoded
+            &server.uri(),
+            "v1.0.0\nv2.0.0\nv3.0.0",
+        )
+        .await
+        .expect("filter go list");
+
+    assert_eq!(
+        filtered, "v1.0.0",
+        "old version serves; young and timeless versions are withheld"
+    );
+    assert_eq!(
+        review_status(&pool, repo_id, module, "v2.0.0").await,
+        "pending"
+    );
+    assert_eq!(
+        review_status(&pool, repo_id, module, "v3.0.0").await,
+        "pending"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn go_first_seen_mode_filters_list_without_upstream_fetch() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+
+    // Unroutable upstream: first_seen mode must never fetch .info documents.
+    let dead_upstream = "http://127.0.0.1:1";
+    let repo_id =
+        create_remote_repo_with_mode(&pool, "fs", "go", dead_upstream, 7, "first_seen").await;
+    let params = repo_params_with_mode(
+        repo_id,
+        "age-gate-go-fs",
+        RepositoryFormat::Go,
+        7,
+        AgeGateMode::FirstSeen,
+    );
+    let module = "example.com/fsmod";
+
+    let filtered = svc
+        .filter_go_version_list(&params, module, module, dead_upstream, "v1.0.0\nv2.0.0")
+        .await
+        .expect("filter go list first-seen");
+    assert_eq!(filtered, "", "first sight withholds everything");
+
+    backdate_observation(&pool, repo_id, module, "v1.0.0", 10).await;
+    let filtered = svc
+        .filter_go_version_list(&params, module, module, dead_upstream, "v1.0.0\nv2.0.0")
+        .await
+        .expect("filter go list after backdate");
+    assert_eq!(filtered, "v1.0.0", "locally aged version becomes visible");
 }
