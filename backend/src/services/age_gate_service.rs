@@ -24,6 +24,38 @@ use crate::services::upstream_metadata::UpstreamMetadataCache;
 
 pub const AUTO_APPROVE_REASON: &str = "auto-approved: crossed age threshold";
 
+/// Where the age-gate cooldown timer starts for a repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgeGateMode {
+    /// Timer starts at the upstream registry's publish timestamp (the
+    /// original #2066 model). Requires a per-version publish time source
+    /// for the repository format.
+    #[default]
+    UpstreamPublishTime,
+    /// Timer starts the first time this server observed the version for the
+    /// repository (an AK-local freshness control, not true publish age).
+    /// Observations are recorded in `age_gate_version_observations` with
+    /// insert-once semantics so the earliest observation is stable.
+    FirstSeen,
+}
+
+impl AgeGateMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UpstreamPublishTime => "upstream_publish_time",
+            Self::FirstSeen => "first_seen",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "upstream_publish_time" => Some(Self::UpstreamPublishTime),
+            "first_seen" => Some(Self::FirstSeen),
+            _ => None,
+        }
+    }
+}
+
 /// Debounce window (seconds) for re-bumping a review's `request_count` /
 /// `last_requested_at` on the metadata listing path. Within this window, repeat
 /// listings of the same package skip the per-version write
@@ -39,9 +71,13 @@ pub struct AgeGateRepoParams {
     pub format: RepositoryFormat,
     pub age_gate_enabled: bool,
     pub age_gate_min_age_days: i32,
+    pub age_gate_mode: AgeGateMode,
 }
 
 impl AgeGateRepoParams {
+    /// Build params with the default `upstream_publish_time` mode. Callers on
+    /// formats that support `first_seen` load the repository's configured mode
+    /// and attach it via [`Self::with_mode`].
     pub fn from_parts(
         id: Uuid,
         key: impl Into<String>,
@@ -57,7 +93,13 @@ impl AgeGateRepoParams {
             format,
             age_gate_enabled,
             age_gate_min_age_days,
+            age_gate_mode: AgeGateMode::default(),
         }
+    }
+
+    pub fn with_mode(mut self, mode: AgeGateMode) -> Self {
+        self.age_gate_mode = mode;
+        self
     }
 
     pub fn from_repository(repo: &crate::models::repository::Repository) -> Self {
@@ -248,7 +290,26 @@ impl AgeGateService {
     pub fn is_applicable(repo: &AgeGateRepoParams) -> bool {
         repo.repo_type == RepositoryType::Remote
             && repo.age_gate_enabled
-            && matches!(repo.format, RepositoryFormat::Npm | RepositoryFormat::Pypi)
+            && Self::supports_format_mode(&repo.format, repo.age_gate_mode)
+    }
+
+    /// The supported (format, mode) matrix. A format is gated only when a
+    /// trustworthy-enough time source is actually wired into its proxy
+    /// handler:
+    /// - npm / PyPI: registry publish time (#2066).
+    /// - Go: `.info` `Time` (publisher-supplied VCS tag time — a backdatable,
+    ///   advisory control, documented as such) or `first_seen`.
+    /// - NuGet: `first_seen` only for now; the registration
+    ///   `catalogEntry.published` source is a follow-up.
+    pub fn supports_format_mode(format: &RepositoryFormat, mode: AgeGateMode) -> bool {
+        match (format, mode) {
+            (RepositoryFormat::Npm | RepositoryFormat::Pypi, AgeGateMode::UpstreamPublishTime) => {
+                true
+            }
+            (RepositoryFormat::Go, _) => true,
+            (RepositoryFormat::Nuget, AgeGateMode::FirstSeen) => true,
+            _ => false,
+        }
     }
 
     /// Compute package age in whole days from upstream publish time.
@@ -451,6 +512,245 @@ impl AgeGateService {
         Ok(())
     }
 
+    /// Record first-seen observations for a batch of versions and return the
+    /// stable `first_seen_at` per version.
+    ///
+    /// Insert-once semantics: `ON CONFLICT DO NOTHING` means concurrent
+    /// observations (multiple requests, multiple replicas) race benignly —
+    /// whoever inserts first fixes the timestamp and every later observation
+    /// reads that same value back. Repeated metadata pulls never move a
+    /// version's `first_seen_at` forward.
+    ///
+    /// Uses the non-macro sqlx API deliberately (no `.sqlx` offline-cache
+    /// entry needed).
+    pub async fn observe_versions_first_seen(
+        &self,
+        repository_id: Uuid,
+        package_name: &str,
+        versions: &[String],
+    ) -> Result<std::collections::HashMap<String, DateTime<Utc>>> {
+        if versions.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO age_gate_version_observations (
+                repository_id, package_name, package_version
+            )
+            SELECT $1, $2, v FROM UNNEST($3::text[]) AS t(v)
+            ON CONFLICT (repository_id, package_name, package_version) DO NOTHING
+            "#,
+        )
+        .bind(repository_id)
+        .bind(package_name)
+        .bind(versions)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+            r#"
+            SELECT package_version, first_seen_at
+            FROM age_gate_version_observations
+            WHERE repository_id = $1 AND package_name = $2
+              AND package_version = ANY($3::text[])
+            "#,
+        )
+        .bind(repository_id)
+        .bind(package_name)
+        .bind(versions)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Record (or read back) the first-seen time for one version. Direct
+    /// downloads call this before the gate decision so a version that never
+    /// appeared in a listing still starts its cooldown at first contact.
+    pub async fn first_seen_time(
+        &self,
+        repository_id: Uuid,
+        package_name: &str,
+        version: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let times = self
+            .observe_versions_first_seen(repository_id, package_name, &[version.to_string()])
+            .await?;
+        Ok(times.get(version).copied())
+    }
+
+    /// Filter a proxied GOPROXY `@v/list` response (one version per line),
+    /// withholding versions blocked by the age gate.
+    ///
+    /// Listing/download agreement: this filter and the `.info`/`.mod`/`.zip`
+    /// download gates use the same time source per mode, so a version hidden
+    /// here is also refused on direct fetch and vice versa.
+    ///
+    /// Time sources:
+    /// - `upstream_publish_time`: per-version `.info` `Time` fetched from the
+    ///   upstream (cached). `Time` is VCS tag/commit time — publisher-supplied
+    ///   and backdatable, so this is an advisory control for Go (documented).
+    /// - `first_seen`: this server's first observation of the version.
+    ///
+    /// Versions whose time cannot be determined (fetch failure, unparseable
+    /// `.info`) are withheld — fail-closed, matching the PEP 691 JSON path.
+    pub async fn filter_go_version_list(
+        &self,
+        repo: &AgeGateRepoParams,
+        module: &str,
+        encoded_module: &str,
+        upstream_url: &str,
+        list_body: &str,
+    ) -> Result<String> {
+        if !Self::is_applicable(repo) {
+            return Ok(list_body.to_string());
+        }
+
+        let versions = parse_go_version_list(list_body);
+        if versions.is_empty() {
+            return Ok(list_body.to_string());
+        }
+
+        let times = match repo.age_gate_mode {
+            AgeGateMode::FirstSeen => {
+                self.observe_versions_first_seen(repo.id, module, &versions)
+                    .await?
+            }
+            AgeGateMode::UpstreamPublishTime => {
+                match crate::services::upstream_metadata::metadata_http_client() {
+                    Ok(client) => {
+                        self.metadata_cache
+                            .fetch_go_publish_times(
+                                &client,
+                                repo.id,
+                                upstream_url,
+                                encoded_module,
+                                &versions,
+                            )
+                            .await
+                    }
+                    // No client: leave every version timeless -> withheld.
+                    Err(_) => std::collections::HashMap::new(),
+                }
+            }
+        };
+
+        let pairs: Vec<(String, Option<DateTime<Utc>>)> = versions
+            .iter()
+            .map(|v| (v.clone(), times.get(v).copied()))
+            .collect();
+
+        let blocked = self.evaluate_versions_batch(repo, module, &pairs).await?;
+
+        if !blocked.is_empty() {
+            metrics_service::record_age_gate_filtered_metadata(
+                &repo.key,
+                format_label(&repo.format),
+            );
+        }
+
+        Ok(rebuild_go_version_list(list_body, &blocked))
+    }
+
+    /// Filter a NuGet flat-container version list (`{"versions": [...]}` or
+    /// the equivalent list built from locally cached artifacts), withholding
+    /// versions blocked by the age gate. `first_seen` mode only for NuGet —
+    /// [`Self::is_applicable`] no-ops otherwise.
+    pub async fn filter_nuget_version_list(
+        &self,
+        repo: &AgeGateRepoParams,
+        package_id: &str,
+        versions: &mut Vec<String>,
+    ) -> Result<()> {
+        if !Self::is_applicable(repo) || versions.is_empty() {
+            return Ok(());
+        }
+
+        let blocked = self
+            .classify_nuget_versions(repo, package_id, versions.as_slice())
+            .await?;
+
+        if !blocked.is_empty() {
+            metrics_service::record_age_gate_filtered_metadata(
+                &repo.key,
+                format_label(&repo.format),
+            );
+            versions.retain(|v| !blocked.contains(&normalize_nuget_version(v)));
+        }
+        Ok(())
+    }
+
+    /// Filter a NuGet registration index document (upstream pass-through or
+    /// locally built): drop inline page items whose `catalogEntry.version` is
+    /// blocked, fix up page/item counts and `lower`/`upper` bounds, and drop
+    /// pages that become empty. Externally referenced pages (no inline
+    /// `items`) point at the upstream registry and are left untouched — the
+    /// download gate still holds for anything discovered through them.
+    pub async fn filter_nuget_registration_index(
+        &self,
+        repo: &AgeGateRepoParams,
+        package_id: &str,
+        doc: &mut serde_json::Value,
+    ) -> Result<()> {
+        if !Self::is_applicable(repo) {
+            return Ok(());
+        }
+
+        let versions = collect_nuget_registration_versions(doc);
+        if versions.is_empty() {
+            return Ok(());
+        }
+
+        let blocked = self
+            .classify_nuget_versions(repo, package_id, &versions)
+            .await?;
+
+        if !blocked.is_empty() {
+            metrics_service::record_age_gate_filtered_metadata(
+                &repo.key,
+                format_label(&repo.format),
+            );
+            apply_nuget_registration_blocks(doc, &blocked);
+        }
+        Ok(())
+    }
+
+    /// Shared NuGet classification: observe/normalize versions, resolve their
+    /// per-mode times, and return the blocked (normalized) version set.
+    async fn classify_nuget_versions(
+        &self,
+        repo: &AgeGateRepoParams,
+        package_id: &str,
+        versions: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut normalized: Vec<String> = versions
+            .iter()
+            .map(|v| normalize_nuget_version(v))
+            .collect();
+        normalized.sort();
+        normalized.dedup();
+
+        let times = match repo.age_gate_mode {
+            AgeGateMode::FirstSeen => {
+                self.observe_versions_first_seen(repo.id, package_id, &normalized)
+                    .await?
+            }
+            // Unreachable while supports_format_mode() excludes it, but stay
+            // fail-closed if that ever changes without wiring a time source.
+            AgeGateMode::UpstreamPublishTime => std::collections::HashMap::new(),
+        };
+
+        let pairs: Vec<(String, Option<DateTime<Utc>>)> = normalized
+            .iter()
+            .map(|v| (v.clone(), times.get(v).copied()))
+            .collect();
+
+        self.evaluate_versions_batch(repo, package_id, &pairs).await
+    }
+
     /// Batch age-gate evaluation for every version in a package metadata document.
     /// Returns the set of versions to withhold from clients.
     ///
@@ -638,29 +938,48 @@ impl AgeGateService {
         self.get_review_by_id(id).await
     }
 
+    /// Update per-repo age-gate config. `mode: None` leaves the stored mode
+    /// unchanged (pre-mode clients PUT only `enabled` + `min_age_days`).
+    /// Non-macro sqlx: `age_gate_mode` is new and the offline query cache is
+    /// regenerated on CI runners only.
     pub async fn update_repo_config(
         &self,
         repo_id: Uuid,
         enabled: bool,
         min_age_days: i32,
+        mode: Option<AgeGateMode>,
     ) -> Result<()> {
         validate_min_age_days(min_age_days)?;
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             UPDATE repositories
-            SET age_gate_enabled = $2, age_gate_min_age_days = $3, updated_at = NOW()
+            SET age_gate_enabled = $2, age_gate_min_age_days = $3,
+                age_gate_mode = COALESCE($4, age_gate_mode), updated_at = NOW()
             WHERE id = $1
             "#,
-            repo_id,
-            enabled,
-            min_age_days
         )
+        .bind(repo_id)
+        .bind(enabled)
+        .bind(min_age_days)
+        .bind(mode.map(|m| m.as_str()))
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Read a repository's configured age-gate mode. Unknown/legacy values
+    /// collapse to the default `upstream_publish_time`.
+    pub async fn load_repo_age_gate_mode(db: &PgPool, repo_id: Uuid) -> Result<AgeGateMode> {
+        let raw: String =
+            sqlx::query_scalar("SELECT age_gate_mode FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_one(db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(AgeGateMode::parse(&raw).unwrap_or_default())
     }
 
     pub async fn find_last_known_good(
@@ -961,6 +1280,128 @@ pub(crate) fn apply_npm_packument_blocks(
     allowed
 }
 
+/// Parse a GOPROXY `@v/list` body into its version lines (trimmed, deduped,
+/// original order preserved). The protocol is one version per line.
+pub(crate) fn parse_go_version_list(body: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| seen.insert(l.to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Rebuild a `@v/list` body without the blocked versions, preserving the
+/// original line order.
+pub(crate) fn rebuild_go_version_list(
+    body: &str,
+    blocked: &std::collections::HashSet<String>,
+) -> String {
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !blocked.contains(*l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Normalize a NuGet version string for identity purposes: lowercase and
+/// strip SemVer 2 build metadata (`+...`), matching how the flat-container
+/// endpoints address versions. Keeps observations, review rows, and the
+/// download path's `{version}` segment on one identity.
+pub(crate) fn normalize_nuget_version(version: &str) -> String {
+    version
+        .split('+')
+        .next()
+        .unwrap_or(version)
+        .to_ascii_lowercase()
+}
+
+/// Collect `catalogEntry.version` values from the inline pages of a NuGet
+/// registration index document. Externally referenced pages (no inline
+/// `items`) contribute nothing.
+pub(crate) fn collect_nuget_registration_versions(doc: &serde_json::Value) -> Vec<String> {
+    let mut versions = Vec::new();
+    let Some(pages) = doc.get("items").and_then(|i| i.as_array()) else {
+        return versions;
+    };
+    for page in pages {
+        let Some(items) = page.get("items").and_then(|i| i.as_array()) else {
+            continue;
+        };
+        for item in items {
+            if let Some(v) = item
+                .get("catalogEntry")
+                .and_then(|c| c.get("version"))
+                .and_then(|v| v.as_str())
+            {
+                versions.push(v.to_string());
+            }
+        }
+    }
+    versions
+}
+
+/// Remove blocked versions from a registration index's inline pages, fixing
+/// up per-page `count`/`lower`/`upper` and the top-level page `count`.
+/// `blocked` holds normalized versions (see [`normalize_nuget_version`]).
+pub(crate) fn apply_nuget_registration_blocks(
+    doc: &mut serde_json::Value,
+    blocked: &std::collections::HashSet<String>,
+) {
+    let Some(pages) = doc.get_mut("items").and_then(|i| i.as_array_mut()) else {
+        return;
+    };
+
+    for page in pages.iter_mut() {
+        let Some(items) = page.get_mut("items").and_then(|i| i.as_array_mut()) else {
+            continue;
+        };
+        items.retain(|item| {
+            item.get("catalogEntry")
+                .and_then(|c| c.get("version"))
+                .and_then(|v| v.as_str())
+                // Items without a parseable version are kept, matching the
+                // HTML/JSON PyPI filters' treatment of unparseable entries.
+                .map(|v| !blocked.contains(&normalize_nuget_version(v)))
+                .unwrap_or(true)
+        });
+
+        let versions: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                item.get("catalogEntry")
+                    .and_then(|c| c.get("version"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let count = items.len();
+        if let Some(obj) = page.as_object_mut() {
+            obj.insert("count".to_string(), serde_json::json!(count));
+            if let Some(first) = versions.first() {
+                obj.insert("lower".to_string(), serde_json::json!(first));
+            }
+            if let Some(last) = versions.last() {
+                obj.insert("upper".to_string(), serde_json::json!(last));
+            }
+        }
+    }
+
+    // Drop inline pages that lost every item; keep external page references.
+    pages.retain(|page| {
+        page.get("items")
+            .and_then(|i| i.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(true)
+    });
+
+    let page_count = pages.len();
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert("count".to_string(), serde_json::json!(page_count));
+    }
+}
+
 /// One anchor span in a PyPI simple-index HTML document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PypiAnchorSpan {
@@ -1178,6 +1619,8 @@ fn format_label(format: &RepositoryFormat) -> &'static str {
     match format {
         RepositoryFormat::Npm => "npm",
         RepositoryFormat::Pypi => "pypi",
+        RepositoryFormat::Go => "go",
+        RepositoryFormat::Nuget => "nuget",
         _ => "other",
     }
 }
@@ -1622,7 +2065,7 @@ mod tests {
             AgeGateDecision::Allow
         ));
 
-        svc.update_repo_config(repo_id, false, 14)
+        svc.update_repo_config(repo_id, false, 14, None)
             .await
             .expect("update repo config");
         let min_age_days: i32 =
@@ -2074,6 +2517,194 @@ mod tests {
             7,
         );
         assert!(!AgeGateService::is_applicable(&local));
+    }
+
+    #[test]
+    fn age_gate_mode_parse_and_as_str_roundtrip() {
+        assert_eq!(
+            AgeGateMode::parse("upstream_publish_time"),
+            Some(AgeGateMode::UpstreamPublishTime)
+        );
+        assert_eq!(
+            AgeGateMode::parse("first_seen"),
+            Some(AgeGateMode::FirstSeen)
+        );
+        assert_eq!(AgeGateMode::parse("nonsense"), None);
+        for mode in [AgeGateMode::UpstreamPublishTime, AgeGateMode::FirstSeen] {
+            assert_eq!(AgeGateMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(AgeGateMode::default(), AgeGateMode::UpstreamPublishTime);
+    }
+
+    #[test]
+    fn supports_format_mode_matrix() {
+        use AgeGateMode::{FirstSeen, UpstreamPublishTime};
+        // npm/pypi: publish-time only (no observation hooks wired yet).
+        assert!(AgeGateService::supports_format_mode(
+            &RepositoryFormat::Npm,
+            UpstreamPublishTime
+        ));
+        assert!(!AgeGateService::supports_format_mode(
+            &RepositoryFormat::Npm,
+            FirstSeen
+        ));
+        assert!(AgeGateService::supports_format_mode(
+            &RepositoryFormat::Pypi,
+            UpstreamPublishTime
+        ));
+        assert!(!AgeGateService::supports_format_mode(
+            &RepositoryFormat::Pypi,
+            FirstSeen
+        ));
+        // Go: both modes.
+        assert!(AgeGateService::supports_format_mode(
+            &RepositoryFormat::Go,
+            UpstreamPublishTime
+        ));
+        assert!(AgeGateService::supports_format_mode(
+            &RepositoryFormat::Go,
+            FirstSeen
+        ));
+        // NuGet: first_seen only until a publish-time source is wired.
+        assert!(!AgeGateService::supports_format_mode(
+            &RepositoryFormat::Nuget,
+            UpstreamPublishTime
+        ));
+        assert!(AgeGateService::supports_format_mode(
+            &RepositoryFormat::Nuget,
+            FirstSeen
+        ));
+        // Everything else: unsupported in every mode.
+        assert!(!AgeGateService::supports_format_mode(
+            &RepositoryFormat::Cargo,
+            UpstreamPublishTime
+        ));
+        assert!(!AgeGateService::supports_format_mode(
+            &RepositoryFormat::Generic,
+            FirstSeen
+        ));
+    }
+
+    #[test]
+    fn is_applicable_honors_mode_for_new_formats() {
+        let nuget_first_seen = AgeGateRepoParams::from_parts(
+            Uuid::new_v4(),
+            "nuget-remote",
+            RepositoryType::Remote,
+            RepositoryFormat::Nuget,
+            true,
+            7,
+        )
+        .with_mode(AgeGateMode::FirstSeen);
+        assert!(AgeGateService::is_applicable(&nuget_first_seen));
+
+        // Default mode (upstream_publish_time) leaves NuGet ungated.
+        let nuget_default = AgeGateRepoParams::from_parts(
+            Uuid::new_v4(),
+            "nuget-remote",
+            RepositoryType::Remote,
+            RepositoryFormat::Nuget,
+            true,
+            7,
+        );
+        assert!(!AgeGateService::is_applicable(&nuget_default));
+
+        let go_default = AgeGateRepoParams::from_parts(
+            Uuid::new_v4(),
+            "go-remote",
+            RepositoryType::Remote,
+            RepositoryFormat::Go,
+            true,
+            7,
+        );
+        assert!(AgeGateService::is_applicable(&go_default));
+    }
+
+    #[test]
+    fn parse_and_rebuild_go_version_list() {
+        let body = "v1.0.0\nv1.1.0\n\n v1.2.0 \nv1.1.0\n";
+        let versions = parse_go_version_list(body);
+        assert_eq!(versions, vec!["v1.0.0", "v1.1.0", "v1.2.0"]);
+
+        let blocked = std::collections::HashSet::from(["v1.1.0".to_string()]);
+        assert_eq!(rebuild_go_version_list(body, &blocked), "v1.0.0\nv1.2.0");
+
+        // Everything blocked -> empty body (module appears version-less).
+        let all: std::collections::HashSet<String> = versions.iter().cloned().collect();
+        assert_eq!(rebuild_go_version_list(body, &all), "");
+
+        assert!(parse_go_version_list("").is_empty());
+    }
+
+    #[test]
+    fn normalize_nuget_version_lowercases_and_strips_build_metadata() {
+        assert_eq!(normalize_nuget_version("13.0.1"), "13.0.1");
+        assert_eq!(normalize_nuget_version("1.0.0-Beta.1"), "1.0.0-beta.1");
+        assert_eq!(normalize_nuget_version("1.0.0+sha.abc123"), "1.0.0");
+        assert_eq!(normalize_nuget_version("2.0.0-RC.1+build.5"), "2.0.0-rc.1");
+    }
+
+    fn sample_registration_doc() -> serde_json::Value {
+        serde_json::json!({
+            "@id": "https://ak.example/nuget/r/v3/registration/demo/index.json",
+            "count": 2,
+            "items": [
+                {
+                    "@id": "page0",
+                    "count": 3,
+                    "lower": "1.0.0",
+                    "upper": "3.0.0",
+                    "items": [
+                        { "catalogEntry": { "id": "demo", "version": "1.0.0" } },
+                        { "catalogEntry": { "id": "demo", "version": "2.0.0" } },
+                        { "catalogEntry": { "id": "demo", "version": "3.0.0" } },
+                    ],
+                },
+                { "@id": "https://upstream.example/page1", "count": 64,
+                  "lower": "4.0.0", "upper": "5.0.0" },
+            ],
+        })
+    }
+
+    #[test]
+    fn collect_nuget_registration_versions_reads_inline_pages_only() {
+        let doc = sample_registration_doc();
+        assert_eq!(
+            collect_nuget_registration_versions(&doc),
+            vec!["1.0.0", "2.0.0", "3.0.0"]
+        );
+        assert!(collect_nuget_registration_versions(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn apply_nuget_registration_blocks_fixes_counts_and_bounds() {
+        let mut doc = sample_registration_doc();
+        let blocked = std::collections::HashSet::from(["3.0.0".to_string()]);
+        apply_nuget_registration_blocks(&mut doc, &blocked);
+
+        let page0 = &doc["items"][0];
+        assert_eq!(page0["count"], serde_json::json!(2));
+        assert_eq!(page0["lower"], serde_json::json!("1.0.0"));
+        assert_eq!(page0["upper"], serde_json::json!("2.0.0"));
+        assert_eq!(page0["items"].as_array().unwrap().len(), 2);
+        // External page reference untouched, top-level page count intact.
+        assert_eq!(doc["items"][1]["@id"], "https://upstream.example/page1");
+        assert_eq!(doc["count"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn apply_nuget_registration_blocks_drops_emptied_inline_pages() {
+        let mut doc = sample_registration_doc();
+        let blocked: std::collections::HashSet<String> = ["1.0.0", "2.0.0", "3.0.0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        apply_nuget_registration_blocks(&mut doc, &blocked);
+
+        let pages = doc["items"].as_array().unwrap();
+        assert_eq!(pages.len(), 1, "emptied inline page dropped");
+        assert_eq!(pages[0]["@id"], "https://upstream.example/page1");
+        assert_eq!(doc["count"], serde_json::json!(1));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryType;
-use crate::services::age_gate_service::AgeGateReview;
+use crate::services::age_gate_service::{AgeGateMode, AgeGateReview};
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::repository_service::RepositoryService as RepoSvc;
 
@@ -101,12 +101,18 @@ pub struct AgeGateConfigResponse {
     pub repository_key: String,
     pub enabled: bool,
     pub min_age_days: i32,
+    /// Age-source mode: `upstream_publish_time` or `first_seen`.
+    pub mode: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateAgeGateConfigRequest {
     pub enabled: bool,
     pub min_age_days: i32,
+    /// Age-source mode. Omitted = keep the currently stored mode, so
+    /// pre-mode clients that PUT only `enabled` + `min_age_days` keep
+    /// working unchanged.
+    pub mode: Option<String>,
 }
 
 fn review_to_response(review: AgeGateReview) -> AgeGateReviewResponse {
@@ -149,11 +155,51 @@ fn build_review_audit_details(
 }
 
 /// Build the audit-log details for a per-repo age-gate config update.
-fn build_repo_config_audit_details(enabled: bool, min_age_days: i32) -> serde_json::Value {
+fn build_repo_config_audit_details(
+    enabled: bool,
+    min_age_days: i32,
+    mode: AgeGateMode,
+) -> serde_json::Value {
     serde_json::json!({
         "age_gate_enabled": enabled,
         "age_gate_min_age_days": min_age_days,
+        "age_gate_mode": mode.as_str(),
     })
+}
+
+/// Parse the request's optional `mode` string, or fall back to the currently
+/// stored mode. Unknown strings are a validation error, not a silent default.
+fn resolve_requested_mode(requested: Option<&str>, current: AgeGateMode) -> Result<AgeGateMode> {
+    match requested {
+        None => Ok(current),
+        Some(raw) => AgeGateMode::parse(raw).ok_or_else(|| {
+            AppError::Validation(format!(
+                "unknown age-gate mode '{raw}' (expected 'upstream_publish_time' or 'first_seen')"
+            ))
+        }),
+    }
+}
+
+/// Enabling the gate requires a (format, mode) pair the proxy handlers can
+/// actually enforce; a config that would silently never gate is rejected.
+/// Disabling is always allowed so a gate can be turned off regardless of the
+/// stored mode.
+fn validate_format_mode_for_enable(
+    enabled: bool,
+    format: &crate::models::repository::RepositoryFormat,
+    mode: AgeGateMode,
+) -> Result<()> {
+    if !enabled
+        || crate::services::age_gate_service::AgeGateService::supports_format_mode(format, mode)
+    {
+        return Ok(());
+    }
+    Err(AppError::Validation(format!(
+        "age gate mode '{}' is not supported for format {:?}; supported: npm/pypi \
+         (upstream_publish_time), go (either mode), nuget (first_seen)",
+        mode.as_str(),
+        format
+    )))
 }
 
 /// Return `Err` when the repository type does not support age-gating.
@@ -316,11 +362,16 @@ pub async fn get_repo_age_gate(
     auth.require_scope("read")?;
     let service = RepoSvc::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
+    let mode = crate::services::age_gate_service::AgeGateService::load_repo_age_gate_mode(
+        &state.db, repo.id,
+    )
+    .await?;
 
     Ok(Json(AgeGateConfigResponse {
         repository_key: key,
         enabled: repo.age_gate_enabled,
         min_age_days: repo.age_gate_min_age_days,
+        mode: mode.as_str().to_string(),
     }))
 }
 
@@ -349,8 +400,15 @@ pub async fn update_repo_age_gate(
 
     require_remote_repo_for_age_gate(&repo.repo_type)?;
 
+    let current_mode = crate::services::age_gate_service::AgeGateService::load_repo_age_gate_mode(
+        &state.db, repo.id,
+    )
+    .await?;
+    let mode = resolve_requested_mode(body.mode.as_deref(), current_mode)?;
+    validate_format_mode_for_enable(body.enabled, &repo.format, mode)?;
+
     let svc = age_gate_service(&state)?;
-    svc.update_repo_config(repo.id, body.enabled, body.min_age_days)
+    svc.update_repo_config(repo.id, body.enabled, body.min_age_days, Some(mode))
         .await?;
 
     let audit = AuditService::new(state.db.clone());
@@ -362,6 +420,7 @@ pub async fn update_repo_age_gate(
                 .details(build_repo_config_audit_details(
                     body.enabled,
                     body.min_age_days,
+                    mode,
                 )),
         )
         .await;
@@ -370,6 +429,7 @@ pub async fn update_repo_age_gate(
         repository_key: key,
         enabled: body.enabled,
         min_age_days: body.min_age_days,
+        mode: mode.as_str().to_string(),
     }))
 }
 
@@ -487,9 +547,68 @@ mod tests {
 
     #[test]
     fn build_repo_config_audit_details_includes_fields() {
-        let d = build_repo_config_audit_details(true, 14);
+        let d = build_repo_config_audit_details(true, 14, AgeGateMode::FirstSeen);
         assert_eq!(d["age_gate_enabled"], true);
         assert_eq!(d["age_gate_min_age_days"], 14);
+        assert_eq!(d["age_gate_mode"], "first_seen");
+    }
+
+    #[test]
+    fn resolve_requested_mode_defaults_and_rejects_unknown() {
+        assert_eq!(
+            resolve_requested_mode(None, AgeGateMode::FirstSeen).unwrap(),
+            AgeGateMode::FirstSeen,
+            "omitted mode keeps the stored one"
+        );
+        assert_eq!(
+            resolve_requested_mode(Some("upstream_publish_time"), AgeGateMode::FirstSeen).unwrap(),
+            AgeGateMode::UpstreamPublishTime
+        );
+        assert!(resolve_requested_mode(Some("bogus"), AgeGateMode::FirstSeen).is_err());
+    }
+
+    #[test]
+    fn validate_format_mode_for_enable_matrix() {
+        use crate::models::repository::RepositoryFormat;
+        // Enabling with an enforceable pair passes.
+        assert!(validate_format_mode_for_enable(
+            true,
+            &RepositoryFormat::Nuget,
+            AgeGateMode::FirstSeen
+        )
+        .is_ok());
+        assert!(validate_format_mode_for_enable(
+            true,
+            &RepositoryFormat::Go,
+            AgeGateMode::UpstreamPublishTime
+        )
+        .is_ok());
+        // Enabling a pair no handler enforces is rejected loudly.
+        assert!(validate_format_mode_for_enable(
+            true,
+            &RepositoryFormat::Nuget,
+            AgeGateMode::UpstreamPublishTime
+        )
+        .is_err());
+        assert!(validate_format_mode_for_enable(
+            true,
+            &RepositoryFormat::Npm,
+            AgeGateMode::FirstSeen
+        )
+        .is_err());
+        assert!(validate_format_mode_for_enable(
+            true,
+            &RepositoryFormat::Cargo,
+            AgeGateMode::UpstreamPublishTime
+        )
+        .is_err());
+        // Disabling is always allowed.
+        assert!(validate_format_mode_for_enable(
+            false,
+            &RepositoryFormat::Cargo,
+            AgeGateMode::FirstSeen
+        )
+        .is_ok());
     }
 
     #[test]

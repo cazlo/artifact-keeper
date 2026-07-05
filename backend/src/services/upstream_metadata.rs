@@ -5,6 +5,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use futures::StreamExt;
 use reqwest::Client;
 use uuid::Uuid;
 
@@ -22,6 +23,21 @@ const PYPI_CACHE_TTL: Duration = Duration::from_secs(60);
 /// than unbounded memory.
 const PYPI_CACHE_MAX_ENTRIES: usize = 4096;
 
+/// Go `.info` publish times are immutable once a version exists (a re-tag is
+/// a new version), so entries can live much longer than the PyPI map. Only
+/// successful parses are cached; failures are refetched.
+const GO_INFO_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+/// Same #1607 lesson as the PyPI map: the key space is attacker-influenced
+/// (any module/version requested through an age-gated Go repo), so the map is
+/// bounded. Per-version entries are a single timestamp, so the cap is higher.
+const GO_INFO_CACHE_MAX_ENTRIES: usize = 16384;
+
+/// Concurrent upstream `.info` fetches per `@v/list` filter pass. The GOPROXY
+/// protocol has no batch endpoint, so first-listing latency for a module is
+/// `ceil(versions / concurrency) * RTT`; the long-TTL cache amortizes repeats.
+const GO_INFO_FETCH_CONCURRENCY: usize = 8;
+
 type PublishTimeMap = HashMap<String, DateTime<Utc>>;
 
 #[derive(Clone)]
@@ -30,10 +46,19 @@ struct CacheEntry {
     fetched_at: Instant,
 }
 
-/// In-process cache for PyPI Warehouse JSON publish times.
+#[derive(Clone, Copy)]
+struct GoInfoCacheEntry {
+    time: DateTime<Utc>,
+    fetched_at: Instant,
+}
+
+/// In-process cache for upstream publish-time metadata (PyPI Warehouse JSON,
+/// Go module `.info`).
 #[derive(Default)]
 pub struct UpstreamMetadataCache {
     pypi: RwLock<HashMap<(Uuid, String), CacheEntry>>,
+    /// (repo, encoded module, version) -> `.info` `Time`.
+    go: RwLock<HashMap<(Uuid, String, String), GoInfoCacheEntry>>,
 }
 
 impl UpstreamMetadataCache {
@@ -96,6 +121,118 @@ impl UpstreamMetadataCache {
         Ok(times)
     }
 
+    /// Fetch Go module publish times for a set of versions by fanning out
+    /// per-version `.info` requests to the upstream GOPROXY (there is no
+    /// batch endpoint in the protocol).
+    ///
+    /// Infallible by design: versions whose `.info` fetch or parse fails are
+    /// simply absent from the returned map, which the age gate treats as
+    /// "no publish time" (fail-closed at the threshold check). `.info`
+    /// bodies are tiny JSON documents read via `Response::json()`, the same
+    /// bounded-enough metadata pattern as the Warehouse fetch (#1608-exempt:
+    /// metadata path, not an artifact stream).
+    ///
+    /// TRUST: `.info` `Time` is the VCS tag/commit time — publisher-supplied
+    /// and backdatable. A Go cooldown built on it is advisory
+    /// defense-in-depth, not a hard security control; `first_seen` mode is
+    /// the alternative when that matters.
+    pub async fn fetch_go_publish_times(
+        &self,
+        client: &Client,
+        repo_id: Uuid,
+        upstream_url: &str,
+        encoded_module: &str,
+        versions: &[String],
+    ) -> PublishTimeMap {
+        let mut times = PublishTimeMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        for version in versions {
+            match self.get_go_cached(repo_id, encoded_module, version) {
+                Some(ts) => {
+                    times.insert(version.clone(), ts);
+                }
+                None => missing.push(version.clone()),
+            }
+        }
+
+        if missing.is_empty() {
+            return times;
+        }
+
+        let base = upstream_url.trim_end_matches('/');
+        let fetched: Vec<(String, Option<DateTime<Utc>>)> =
+            futures::stream::iter(missing.into_iter().map(|version| {
+                let url = format!("{base}/{encoded_module}/@v/{version}.info");
+                let client = client.clone();
+                async move {
+                    let time = fetch_go_info_time(&client, &url).await;
+                    (version, time)
+                }
+            }))
+            .buffer_unordered(GO_INFO_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+        for (version, time) in fetched {
+            if let Some(ts) = time {
+                self.set_go_cached(repo_id, encoded_module, &version, ts);
+                times.insert(version, ts);
+            }
+        }
+        times
+    }
+
+    /// Single-version convenience wrapper for the download-gate path.
+    pub async fn fetch_go_publish_time(
+        &self,
+        client: &Client,
+        repo_id: Uuid,
+        upstream_url: &str,
+        encoded_module: &str,
+        version: &str,
+    ) -> Option<DateTime<Utc>> {
+        let versions = [version.to_string()];
+        self.fetch_go_publish_times(client, repo_id, upstream_url, encoded_module, &versions)
+            .await
+            .get(version)
+            .copied()
+    }
+
+    fn get_go_cached(
+        &self,
+        repo_id: Uuid,
+        encoded_module: &str,
+        version: &str,
+    ) -> Option<DateTime<Utc>> {
+        let guard = self.go.read().ok()?;
+        let entry = guard.get(&(repo_id, encoded_module.to_string(), version.to_string()))?;
+        (entry.fetched_at.elapsed() <= GO_INFO_CACHE_TTL).then_some(entry.time)
+    }
+
+    fn set_go_cached(
+        &self,
+        repo_id: Uuid,
+        encoded_module: &str,
+        version: &str,
+        time: DateTime<Utc>,
+    ) {
+        if let Ok(mut guard) = self.go.write() {
+            if guard.len() >= GO_INFO_CACHE_MAX_ENTRIES {
+                guard.retain(|_, entry| entry.fetched_at.elapsed() <= GO_INFO_CACHE_TTL);
+                if guard.len() >= GO_INFO_CACHE_MAX_ENTRIES {
+                    guard.clear();
+                }
+            }
+            guard.insert(
+                (repo_id, encoded_module.to_string(), version.to_string()),
+                GoInfoCacheEntry {
+                    time,
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+    }
+
     fn get_pypi_cached(&self, key: &(Uuid, String)) -> Option<PublishTimeMap> {
         let guard = self.pypi.read().ok()?;
         let entry = guard.get(key)?;
@@ -141,6 +278,22 @@ fn pypi_cache_key(repo_id: Uuid, project: &str) -> (Uuid, String) {
 
 fn is_pypi_cache_fresh(elapsed: Duration, ttl: Duration) -> bool {
     elapsed <= ttl
+}
+
+/// Fetch one `.info` document and extract its `Time`, or `None` on any
+/// failure (network, non-2xx, parse). Failures are intentionally not cached.
+async fn fetch_go_info_time(client: &Client, url: &str) -> Option<DateTime<Utc>> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = response.json().await.ok()?;
+    parse_go_info_time(&body)
+}
+
+/// Parse a GOPROXY `.info` JSON document's `Time` field.
+pub fn parse_go_info_time(info: &serde_json::Value) -> Option<DateTime<Utc>> {
+    info.get("Time").and_then(parse_iso_timestamp)
 }
 
 /// Build the PyPI Warehouse JSON URL from a simple-index upstream base.
@@ -376,6 +529,70 @@ mod tests {
             .fetch_pypi_publish_times(&client, Uuid::new_v4(), &server.uri(), "bad-json")
             .await
             .is_err());
+    }
+
+    #[test]
+    fn parse_go_info_time_reads_time_field() {
+        let info = json!({
+            "Version": "v1.9.0",
+            "Time": "2024-02-29T14:36:18Z",
+            "Origin": { "VCS": "git" }
+        });
+        let parsed = parse_go_info_time(&info).expect("Time parses");
+        assert_eq!(parsed.to_rfc3339(), "2024-02-29T14:36:18+00:00");
+        assert!(parse_go_info_time(&json!({ "Version": "v1.0.0" })).is_none());
+        assert!(parse_go_info_time(&json!({ "Time": "garbage" })).is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_go_publish_times_fans_out_and_skips_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/example.com/demo/@v/v1.0.0.info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Version": "v1.0.0",
+                "Time": "2020-01-02T03:04:05Z"
+            })))
+            // The second call must be served from the long-TTL cache.
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/example.com/demo/@v/v2.0.0.info"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let cache = UpstreamMetadataCache::new();
+        let client = metadata_http_client().expect("metadata client");
+        let repo = Uuid::new_v4();
+        let versions = vec!["v1.0.0".to_string(), "v2.0.0".to_string()];
+
+        let times = cache
+            .fetch_go_publish_times(&client, repo, &server.uri(), "example.com/demo", &versions)
+            .await;
+        assert_eq!(times.len(), 1, "failed fetch leaves the version timeless");
+        assert!(times.contains_key("v1.0.0"));
+
+        let again = cache
+            .fetch_go_publish_time(&client, repo, &server.uri(), "example.com/demo", "v1.0.0")
+            .await;
+        assert_eq!(again, times.get("v1.0.0").copied(), "cache hit");
+    }
+
+    #[test]
+    fn go_cache_growth_is_bounded() {
+        let cache = UpstreamMetadataCache::new();
+        let repo = Uuid::new_v4();
+        let now = Utc::now();
+        for i in 0..GO_INFO_CACHE_MAX_ENTRIES {
+            cache.set_go_cached(repo, "example.com/demo", &format!("v0.0.{i}"), now);
+        }
+        assert_eq!(cache.go.read().unwrap().len(), GO_INFO_CACHE_MAX_ENTRIES);
+
+        cache.set_go_cached(repo, "example.com/demo", "v9.9.9", now);
+        let guard = cache.go.read().unwrap();
+        assert_eq!(guard.len(), 1, "cap enforced even when nothing is stale");
     }
 
     #[test]

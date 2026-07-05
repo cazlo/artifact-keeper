@@ -3949,6 +3949,8 @@ pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::Ag
     let format = match info.format.to_lowercase().as_str() {
         "npm" => RepositoryFormat::Npm,
         "pypi" => RepositoryFormat::Pypi,
+        "go" => RepositoryFormat::Go,
+        "nuget" => RepositoryFormat::Nuget,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
@@ -3964,6 +3966,32 @@ pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::Ag
         info.age_gate_enabled,
         info.age_gate_min_age_days,
     )
+}
+
+/// Build age-gate params with the repository's configured age-source mode
+/// attached (one PK scalar read, only when the gate could apply).
+///
+/// [`age_gate_params`] is kept sync and defaults to `upstream_publish_time`,
+/// which is correct for the npm/PyPI call sites (the only formats where that
+/// is the sole supported mode). Handlers for formats that support
+/// `first_seen` (Go, NuGet) must use this resolved variant so the mode column
+/// actually takes effect. DB failure surfaces as a 5xx rather than silently
+/// degrading to a differently-moded (or disabled) gate.
+pub async fn age_gate_params_resolved(
+    db: &PgPool,
+    info: &RepoInfo,
+) -> Result<crate::services::age_gate_service::AgeGateRepoParams, Response> {
+    use crate::models::repository::RepositoryType;
+    use crate::services::age_gate_service::AgeGateService;
+
+    let params = age_gate_params(info);
+    if !info.age_gate_enabled || params.repo_type != RepositoryType::Remote {
+        return Ok(params);
+    }
+    let mode = AgeGateService::load_repo_age_gate_mode(db, info.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    Ok(params.with_mode(mode))
 }
 
 /// HTTP 451 JSON body when a package version is blocked by the age gate with no LKG.
