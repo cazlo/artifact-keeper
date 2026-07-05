@@ -28,6 +28,8 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::age_gate_service::{AgeGateDecision, AgeGateMode, AgeGateService};
+use chrono::{DateTime, Utc};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -195,6 +197,110 @@ use crate::api::middleware::auth::require_auth_with_bearer_fallback;
 
 async fn resolve_go_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["go"], "a Go").await
+}
+
+// ---------------------------------------------------------------------------
+// Age gate (remote repos; issue #1558 format expansion)
+// ---------------------------------------------------------------------------
+
+/// Filter a `@v/list` body through the age gate so listings and the
+/// `.info`/`.mod`/`.zip` download gates agree on the visible version set.
+/// No-ops when the gate does not apply to this repository.
+async fn apply_go_list_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    module: &str,
+    encoded_module: &str,
+    body: String,
+) -> Result<String, Response> {
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return Ok(body);
+    };
+    let params = proxy_helpers::age_gate_params_resolved(&state.db, repo).await?;
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(body);
+    }
+    let upstream_url = repo.upstream_url.as_deref().unwrap_or_default();
+    svc.filter_go_version_list(&params, module, encoded_module, upstream_url, &body)
+        .await
+        .map_err(|e| e.into_response())
+}
+
+/// Age-gate a single module version on the metadata/download paths
+/// (`.info`, `.mod`, `.zip`, `@latest`). Runs BEFORE any artifact lookup or
+/// upstream fetch so neither the local cache nor the streaming path can serve
+/// a blocked version.
+///
+/// `known_time` lets callers that already parsed the version's `.info` `Time`
+/// (the `@latest` path) skip the side fetch in publish-time mode; `first_seen`
+/// mode records the observation instead, so a direct download starts the
+/// cooldown even for versions never listed.
+///
+/// Unlike npm there is no last-known-good substitution: the Go toolchain
+/// verifies module content against go.sum, so serving a different version
+/// under the requested URL would only produce checksum mismatch errors. A
+/// block is always a structured 451.
+async fn apply_go_download_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    module: &str,
+    version: &str,
+    known_time: Option<DateTime<Utc>>,
+) -> Result<(), Response> {
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return Ok(());
+    };
+    let params = proxy_helpers::age_gate_params_resolved(&state.db, repo).await?;
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(());
+    }
+
+    let published_at = match params.age_gate_mode {
+        AgeGateMode::FirstSeen => svc
+            .first_seen_time(repo.id, module, version)
+            .await
+            .map_err(|e| e.into_response())?,
+        AgeGateMode::UpstreamPublishTime => match known_time {
+            Some(t) => Some(t),
+            None => match (
+                repo.upstream_url.as_deref(),
+                crate::services::upstream_metadata::metadata_http_client(),
+            ) {
+                (Some(upstream_url), Ok(client)) => {
+                    svc.metadata_cache()
+                        .fetch_go_publish_time(
+                            &client,
+                            repo.id,
+                            upstream_url,
+                            &encode_module_path(module),
+                            version,
+                        )
+                        .await
+                }
+                // No upstream/client -> no publish time -> fail closed below.
+                _ => None,
+            },
+        },
+    };
+
+    match svc
+        .check(&params, module, version, published_at)
+        .await
+        .map_err(|e| e.into_response())?
+    {
+        AgeGateDecision::Allow => Ok(()),
+        AgeGateDecision::Block { review_id, .. } => {
+            let requested_age_days =
+                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
+            Err(proxy_helpers::age_gate_blocked_response(
+                review_id,
+                module,
+                version,
+                params.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +596,39 @@ async fn list_versions(
 
         let encoded = encode_module_path(module);
         let upstream_path = format!("{}/@v/list", encoded);
+
+        // Remote repo: fetch the upstream list and filter it through the age
+        // gate before responding, so listings agree with the download gates.
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch_capped(
+                    proxy,
+                    repo.id,
+                    &repo.key,
+                    upstream_url,
+                    &upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                )
+                .await
+                {
+                    let upstream_body = String::from_utf8_lossy(&content).into_owned();
+                    let filtered =
+                        apply_go_list_age_gate(state, repo, module, &encoded, upstream_body)
+                            .await?;
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                        .body(Body::from(filtered))
+                        .unwrap());
+                }
+            }
+            return Err((StatusCode::NOT_FOUND, "module not found").into_response());
+        }
+
+        // Virtual repos keep the unfiltered pass-through (documented v1
+        // age-gate limitation, same as npm/PyPI).
         if let Ok(resp) =
             try_proxy_go_metadata(state, repo, &upstream_path, "text/plain; charset=utf-8").await
         {
@@ -498,6 +637,11 @@ async fn list_versions(
 
         return Err((StatusCode::NOT_FOUND, "module not found").into_response());
     }
+
+    // Locally stored versions of a Remote repo are still upstream content:
+    // filter them too so a cached young version cannot appear in the listing.
+    let encoded = encode_module_path(module);
+    let body = apply_go_list_age_gate(state, repo, module, &encoded, body).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -516,6 +660,10 @@ async fn version_info(
     module: &str,
     version: &str,
 ) -> Result<Response, Response> {
+    // Age gate before any lookup: a blocked version's `.info` must not be
+    // visible from the local cache or the upstream proxy path.
+    apply_go_download_age_gate(state, repo, module, version, None).await?;
+
     let artifact = sqlx::query!(
         r#"
         SELECT a.created_at
@@ -621,6 +769,10 @@ async fn get_mod_file(
     module: &str,
     version: &str,
 ) -> Result<Response, Response> {
+    // Age gate before any lookup/fetch (MVS reads `.mod` for graph
+    // computation; the block must hold here as well as on `.zip`).
+    apply_go_download_age_gate(state, repo, module, version, None).await?;
+
     let artifact = sqlx::query!(
         r#"
         SELECT id, storage_key, size_bytes
@@ -759,6 +911,11 @@ async fn download_zip(
     module: &str,
     version: &str,
 ) -> Result<Response, Response> {
+    // Age gate before the artifact lookup AND before the streaming fetch,
+    // mirroring npm's serve_tarball ordering: a blocked version can be
+    // served neither from local cache nor from upstream.
+    apply_go_download_age_gate(state, repo, module, version, None).await?;
+
     let artifact = sqlx::query!(
         r#"
         SELECT id, storage_key, size_bytes, checksum_sha256
@@ -926,6 +1083,58 @@ async fn latest_version(
         Err(not_found) => {
             let encoded = encode_module_path(module);
             let upstream_path = format!("{}/@latest", encoded);
+
+            // Remote repo: fetch `@latest`, then age-gate the version it
+            // names before serving it. The Go toolchain only consults
+            // `@latest` when `@v/list` is empty, so when every tagged
+            // version is blocked (or the module only has pseudo-versions)
+            // the client gets the structured 451 instead of resolving a
+            // young version. Documents whose Version cannot be parsed pass
+            // through: the name alone is not what the gate protects, and
+            // `.info`/`.mod`/`.zip` remain gated.
+            if repo.repo_type == RepositoryType::Remote {
+                if let (Some(ref upstream_url), Some(ref proxy)) =
+                    (&repo.upstream_url, &state.proxy_service)
+                {
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
+                        proxy,
+                        repo.id,
+                        &repo.key,
+                        upstream_url,
+                        &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                    )
+                    .await
+                    {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
+                            if let Some(latest_version) =
+                                json.get("Version").and_then(|v| v.as_str())
+                            {
+                                let known_time =
+                                    crate::services::upstream_metadata::parse_go_info_time(&json);
+                                apply_go_download_age_gate(
+                                    state,
+                                    repo,
+                                    module,
+                                    latest_version,
+                                    known_time,
+                                )
+                                .await?;
+                            }
+                        }
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(
+                                CONTENT_TYPE,
+                                content_type.unwrap_or_else(|| "application/json".to_string()),
+                            )
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
+                }
+                return Err(not_found);
+            }
+
             if let Ok(resp) =
                 try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
             {
@@ -936,6 +1145,10 @@ async fn latest_version(
     };
 
     let version = artifact.version.unwrap_or_default();
+
+    // A locally cached "latest" of a Remote repo is still upstream content.
+    apply_go_download_age_gate(state, repo, module, &version, None).await?;
+
     let time_str = artifact.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let info = serde_json::json!({
