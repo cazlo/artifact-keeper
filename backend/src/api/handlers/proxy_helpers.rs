@@ -4169,6 +4169,9 @@ pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::Ag
 }
 
 /// HTTP 451 JSON body when a package version is blocked by the age gate with no LKG.
+/// Delegates to [`crate::error::age_gate_blocked_json`] so the handler-layer body
+/// and the boundary-layer [`crate::error::AppError::AgeGateBlocked`] rendering
+/// share one shape (#2264).
 pub fn age_gate_blocked_body(
     review_id: uuid::Uuid,
     package: &str,
@@ -4176,15 +4179,13 @@ pub fn age_gate_blocked_body(
     min_age_days: i32,
     requested_age_days: Option<i64>,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "error": "age_gate_blocked",
-        "review_id": review_id,
-        "package": package,
-        "version": version,
-        "min_age_days": min_age_days,
-        "requested_age_days": requested_age_days,
-        "message": "Package version is younger than the configured age threshold and is pending review"
-    })
+    crate::error::age_gate_blocked_json(
+        review_id,
+        package,
+        version,
+        min_age_days,
+        requested_age_days,
+    )
 }
 
 /// HTTP 451 response when a package version is blocked by the age gate with no LKG.

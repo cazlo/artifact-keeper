@@ -605,6 +605,37 @@ fn html_escape_pep503(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Classify a PyPI proxy-cache path for the download age gate (#2264).
+///
+/// PyPI download cache paths are `simple/{project}/{filename}` (see
+/// `build_pypi_proxy_cache_path` in the handler); the two-segment
+/// `simple/{project}` form is the simple-index document itself. A PEP 658
+/// `{filename}.metadata` sidecar is version-addressed and classifies with its
+/// artifact, matching the handler-layer gate's parsing today. Deeper paths
+/// under `simple/` are artifact-shaped but non-canonical — reject rather than
+/// let them bypass as metadata. Paths outside `simple/` are index documents.
+pub fn classify_download_path(cache_path: &str) -> crate::formats::DownloadPathClass {
+    use crate::formats::DownloadPathClass;
+
+    let mut parts = cache_path.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("simple"), Some(project), Some(filename), None) => {
+            if project.is_empty() || filename.is_empty() {
+                return DownloadPathClass::InvalidArtifactPath;
+            }
+            match PypiHandler::version_from_filename(filename) {
+                Some(version) => DownloadPathClass::Artifact {
+                    package: project.to_string(),
+                    version,
+                },
+                None => DownloadPathClass::InvalidArtifactPath,
+            }
+        }
+        (Some("simple"), Some(_), Some(_), Some(_)) => DownloadPathClass::InvalidArtifactPath,
+        _ => DownloadPathClass::Metadata,
+    }
+}
+
 impl Default for PypiHandler {
     fn default() -> Self {
         Self::new()
@@ -794,6 +825,80 @@ pub fn generate_simple_package_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::DownloadPathClass;
+
+    // ---- classify_download_path (#2264 boundary age gate) ----
+
+    #[test]
+    fn classify_simple_index_paths_as_metadata() {
+        assert_eq!(
+            classify_download_path("simple/requests"),
+            DownloadPathClass::Metadata
+        );
+        // Root index and non-simple cache keys are index documents.
+        assert_eq!(
+            classify_download_path("simple"),
+            DownloadPathClass::Metadata
+        );
+        assert_eq!(
+            classify_download_path("pypi/requests/json"),
+            DownloadPathClass::Metadata
+        );
+    }
+
+    #[test]
+    fn classify_wheel_and_sdist_paths_as_artifact() {
+        assert_eq!(
+            classify_download_path("simple/requests/requests-2.31.0-py3-none-any.whl"),
+            DownloadPathClass::Artifact {
+                package: "requests".to_string(),
+                version: "2.31.0".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_download_path("simple/requests/requests-2.31.0.tar.gz"),
+            DownloadPathClass::Artifact {
+                package: "requests".to_string(),
+                version: "2.31.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_pep658_metadata_sidecar_with_its_artifact() {
+        // `.metadata` is version-addressed; it classifies (and gates) with the
+        // artifact it describes, matching the handler-layer parse today.
+        assert_eq!(
+            classify_download_path("simple/requests/requests-2.31.0-py3-none-any.whl.metadata"),
+            DownloadPathClass::Artifact {
+                package: "requests".to_string(),
+                version: "2.31.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_artifact_shaped_paths_with_bad_coordinates_as_invalid() {
+        // Unparseable filename in the download position.
+        assert_eq!(
+            classify_download_path("simple/requests/not-a-real-dist"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+        // Deeper-than-canonical paths under simple/ are artifact-shaped: reject.
+        assert_eq!(
+            classify_download_path("simple/requests/sub/requests-2.31.0.tar.gz"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+        // Empty segments around the download position.
+        assert_eq!(
+            classify_download_path("simple//requests-2.31.0.tar.gz"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+        assert_eq!(
+            classify_download_path("simple/requests/"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+    }
 
     // ========================================================================
     // render_simple_root_html tests (B8): the PEP 503 root index must emit

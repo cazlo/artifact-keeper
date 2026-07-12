@@ -128,6 +128,50 @@ pub enum AppError {
     /// output) are NOT `NotFound` and stay on the `Internal` -> `failed` path.
     #[error("Scanner engine unavailable: {0}")]
     ScannerEngineUnavailable(String),
+
+    /// A package version withheld by a repository's age gate (#2264). Carries
+    /// the complete typed decision through the proxy service boundary so
+    /// format handlers can intercept it (last-known-good substitution) before
+    /// generic mapping renders the structured 451 body. The body never
+    /// includes the LKG — it exists only for handler interception.
+    #[error("Age gate blocked: {} {} is pending review", .0.package, .0.version)]
+    AgeGateBlocked(Box<AgeGateBlockedContext>),
+}
+
+/// Typed payload for [`AppError::AgeGateBlocked`]: the full decision from
+/// `AgeGateService::check`, preserved across the proxy boundary instead of
+/// being flattened into an HTTP response at the point of evaluation.
+#[derive(Debug, Clone)]
+pub struct AgeGateBlockedContext {
+    pub review_id: uuid::Uuid,
+    pub package: String,
+    pub version: String,
+    pub min_age_days: i32,
+    pub requested_age_days: Option<i64>,
+    pub last_known_good: Option<crate::services::age_gate_service::LastKnownGood>,
+}
+
+/// Structured 451 JSON body for an age-gate block served without a
+/// last-known-good substitute. Single source of truth for the body shape:
+/// `proxy_helpers::age_gate_blocked_body` and the generic
+/// [`AppError::AgeGateBlocked`] rendering both delegate here, so the
+/// handler-layer and boundary-layer 451s cannot drift apart.
+pub fn age_gate_blocked_json(
+    review_id: uuid::Uuid,
+    package: &str,
+    version: &str,
+    min_age_days: i32,
+    requested_age_days: Option<i64>,
+) -> serde_json::Value {
+    json!({
+        "error": "age_gate_blocked",
+        "review_id": review_id,
+        "package": package,
+        "version": version,
+        "min_age_days": min_age_days,
+        "requested_age_days": requested_age_days,
+        "message": "Package version is younger than the configured age threshold and is pending review"
+    })
 }
 
 impl AppError {
@@ -200,6 +244,10 @@ impl AppError {
             Self::ScannerEngineUnavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SCANNER_ENGINE_UNAVAILABLE",
+            ),
+            Self::AgeGateBlocked(_) => (
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                "AGE_GATE_BLOCKED",
             ),
         }
     }
@@ -277,6 +325,10 @@ impl AppError {
             | Self::ServiceUnavailable(msg)
             | Self::ScannerEngineUnavailable(msg) => msg.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
+            Self::AgeGateBlocked(_) => {
+                "Package version is younger than the configured age threshold and is pending review"
+                    .to_string()
+            }
         }
     }
 }
@@ -292,10 +344,22 @@ impl IntoResponse for AppError {
             _ => tracing::info!(error = %self, code = code, "Request error"),
         }
 
-        let body = Json(json!({
-            "code": code,
-            "message": message,
-        }));
+        // Age-gate blocks render the structured 451 body every existing
+        // client and test already parses (`error: "age_gate_blocked"`, review
+        // and coordinate fields) instead of the generic code/message envelope.
+        let body = match &self {
+            Self::AgeGateBlocked(ctx) => Json(age_gate_blocked_json(
+                ctx.review_id,
+                &ctx.package,
+                &ctx.version,
+                ctx.min_age_days,
+                ctx.requested_age_days,
+            )),
+            _ => Json(json!({
+                "code": code,
+                "message": message,
+            })),
+        };
 
         let mut response = (status, body).into_response();
         // Tell well-behaved clients to back off on capacity-shed responses so
@@ -313,6 +377,76 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #2264: the typed age-gate block must map to the structured 451 the
+    // handler-layer gates already emit, so boundary enforcement cannot drift
+    // from the shape clients (and age_gate_tests) parse today.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_age_gate_blocked_maps_to_structured_451() {
+        let review_id = uuid::Uuid::new_v4();
+        let err = AppError::AgeGateBlocked(Box::new(AgeGateBlockedContext {
+            review_id,
+            package: "lodash".to_string(),
+            version: "9.9.9".to_string(),
+            min_age_days: 14,
+            requested_age_days: Some(3),
+            last_known_good: Some(crate::services::age_gate_service::LastKnownGood {
+                version: "4.17.21".to_string(),
+                artifact_path: "lodash/-/lodash-4.17.21.tgz".to_string(),
+            }),
+        }));
+
+        let (status, code) = err.status_and_code();
+        assert_eq!(status, StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert_eq!(code, "AGE_GATE_BLOCKED");
+        // 451 is client-caused policy traffic, not a server fault.
+        assert_eq!(err.log_level(), tracing::Level::INFO);
+
+        let body = age_gate_blocked_json(review_id, "lodash", "9.9.9", 14, Some(3));
+        assert_eq!(body["error"], "age_gate_blocked");
+        assert_eq!(body["review_id"], review_id.to_string());
+        assert_eq!(body["package"], "lodash");
+        assert_eq!(body["version"], "9.9.9");
+        assert_eq!(body["min_age_days"], 14);
+        assert_eq!(body["requested_age_days"], 3);
+        // The LKG exists only for handler interception; the generic 451 body
+        // must never carry it.
+        assert!(body.get("last_known_good").is_none());
+        assert!(err.user_message().contains("pending review"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // buffering a 451 test body is not an artifact path (#1608)
+    async fn test_age_gate_blocked_into_response_renders_451_body() {
+        let review_id = uuid::Uuid::new_v4();
+        let err = AppError::AgeGateBlocked(Box::new(AgeGateBlockedContext {
+            review_id,
+            package: "p".to_string(),
+            version: "1.0.0".to_string(),
+            min_age_days: 7,
+            requested_age_days: None,
+            last_known_good: None,
+        }));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read 451 body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("451 body is JSON");
+        assert_eq!(v["error"], "age_gate_blocked");
+        assert_eq!(v["review_id"], review_id.to_string());
+        assert_eq!(v["version"], "1.0.0");
+        assert!(v["requested_age_days"].is_null());
+    }
+
+    #[test]
+    fn test_age_gate_blocked_json_null_age_when_publish_time_unknown() {
+        let body = age_gate_blocked_json(uuid::Uuid::new_v4(), "p", "1.0.0", 7, None);
+        assert!(body["requested_age_days"].is_null());
+    }
 
     // -----------------------------------------------------------------------
     // Server-side errors: user_message must NOT leak internal details

@@ -155,6 +155,35 @@ impl NpmHandler {
     }
 }
 
+/// Classify an npm proxy-cache path for the download age gate (#2264).
+///
+/// npm tarball cache paths take the canonical shape
+/// `{package}/-/{filename}.tgz` (scoped packages keep the literal `/`:
+/// `@scope/name/-/name-1.0.0.tgz`, where the filename uses the short name).
+/// Every other path this handler caches — packuments (`{package}`),
+/// dist-tags, search — is metadata. An artifact-shaped path whose version
+/// cannot be parsed is `InvalidArtifactPath`, mirroring the fail-closed
+/// `extract_version_from_filename` error the handler-layer gate raises today.
+pub fn classify_download_path(cache_path: &str) -> crate::formats::DownloadPathClass {
+    use crate::formats::DownloadPathClass;
+
+    let Some((package, filename)) = cache_path.split_once("/-/") else {
+        return DownloadPathClass::Metadata;
+    };
+    if package.is_empty() || filename.is_empty() || filename.contains('/') {
+        return DownloadPathClass::InvalidArtifactPath;
+    }
+    // Scoped packages parse the version against the short (post-slash) name.
+    let short_name = package.rsplit('/').next().unwrap_or(package);
+    match NpmHandler::extract_version_from_filename(filename, short_name) {
+        Ok(version) if !version.is_empty() => DownloadPathClass::Artifact {
+            package: package.to_string(),
+            version,
+        },
+        _ => DownloadPathClass::InvalidArtifactPath,
+    }
+}
+
 impl Default for NpmHandler {
     fn default() -> Self {
         Self::new()
@@ -623,6 +652,88 @@ pub fn generate_packument(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::DownloadPathClass;
+
+    // ---- classify_download_path (#2264 boundary age gate) ----
+
+    #[test]
+    fn classify_packument_and_search_paths_as_metadata() {
+        assert_eq!(
+            classify_download_path("lodash"),
+            DownloadPathClass::Metadata
+        );
+        assert_eq!(
+            classify_download_path("@types%2fnode"),
+            DownloadPathClass::Metadata
+        );
+        assert_eq!(
+            classify_download_path("-/v1/search?text=react"),
+            DownloadPathClass::Metadata
+        );
+        assert_eq!(
+            classify_download_path("-/package/lodash/dist-tags"),
+            DownloadPathClass::Metadata
+        );
+    }
+
+    #[test]
+    fn classify_tarball_path_as_artifact() {
+        assert_eq!(
+            classify_download_path("lodash/-/lodash-4.17.21.tgz"),
+            DownloadPathClass::Artifact {
+                package: "lodash".to_string(),
+                version: "4.17.21".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_scoped_tarball_uses_short_name_for_version() {
+        assert_eq!(
+            classify_download_path("@types/node/-/node-20.1.0.tgz"),
+            DownloadPathClass::Artifact {
+                package: "@types/node".to_string(),
+                version: "20.1.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_artifact_shaped_paths_with_bad_coordinates_as_invalid() {
+        // Filename does not carry the package prefix: version unparseable.
+        assert_eq!(
+            classify_download_path("lodash/-/react-18.0.0.tgz"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+        // Wrong extension.
+        assert_eq!(
+            classify_download_path("lodash/-/lodash-4.17.21.zip"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+        // Empty version (`lodash-.tgz`).
+        assert_eq!(
+            classify_download_path("lodash/-/lodash-.tgz"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+        // Nested filename segment / double separator: artifact-shaped, reject.
+        assert_eq!(
+            classify_download_path("lodash/-/x/lodash-4.17.21.tgz"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+        assert_eq!(
+            classify_download_path("a/-/b/-/c.tgz"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+        // Empty package or filename around the separator.
+        assert_eq!(
+            classify_download_path("/-/lodash-4.17.21.tgz"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+        assert_eq!(
+            classify_download_path("lodash/-/"),
+            DownloadPathClass::InvalidArtifactPath
+        );
+    }
 
     // ---- NpmHandler::new / Default ----
 

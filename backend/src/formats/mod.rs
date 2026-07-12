@@ -248,6 +248,49 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
     }
 }
 
+/// Tri-state classification of a proxy-cache path for boundary age-gate
+/// enforcement (#2264).
+///
+/// Three states, not two: collapsing `InvalidArtifactPath` into `Metadata`
+/// would turn today's fail-closed npm/PyPI coordinate-parse errors into
+/// ungated fetches. An artifact-shaped path whose coordinates cannot be
+/// parsed must be rejected, never served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadPathClass {
+    /// Index/listing/registration document — bypasses the download gate.
+    /// Publish-time resolver fetches classify here, so gate evaluation
+    /// cannot recurse through the boundary.
+    Metadata,
+    /// A version-addressed package artifact — enters the download gate.
+    Artifact { package: String, version: String },
+    /// Artifact-shaped path with unparseable coordinates — reject (fail
+    /// closed), never classify as metadata.
+    InvalidArtifactPath,
+}
+
+/// Classify `cache_path` for the download age gate, keyed by the repository
+/// format the proxy boundary resolved from the DB (#2264).
+///
+/// Returns `None` when no classifier is registered for `format`. The boundary
+/// must treat an *enabled* gate on a `None` format as a configuration error —
+/// never as an implicit metadata/allow result. Formats gain entries here as
+/// their gate support lands (npm + pypi first; the matrix in
+/// `AgeGateService::is_applicable` must stay in sync).
+pub fn classify_download_path(
+    format: &RepositoryFormat,
+    cache_path: &str,
+) -> Option<DownloadPathClass> {
+    match format {
+        RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Pnpm => {
+            Some(npm::classify_download_path(cache_path))
+        }
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry => {
+            Some(pypi::classify_download_path(cache_path))
+        }
+        _ => None,
+    }
+}
+
 /// List all supported core format keys.
 pub fn list_core_formats() -> Vec<&'static str> {
     vec![
@@ -303,4 +346,59 @@ pub fn list_core_formats() -> Vec<&'static str> {
         "incus",
         "lxc",
     ]
+}
+
+#[cfg(test)]
+mod classify_download_path_tests {
+    use super::*;
+
+    #[test]
+    fn npm_and_pypi_families_have_registered_classifiers() {
+        for format in [
+            RepositoryFormat::Npm,
+            RepositoryFormat::Yarn,
+            RepositoryFormat::Pnpm,
+            RepositoryFormat::Pypi,
+            RepositoryFormat::Poetry,
+        ] {
+            assert!(
+                classify_download_path(&format, "anything").is_some(),
+                "{format:?} must have a registered download-path classifier"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_formats_have_no_classifier() {
+        // `None` means "no classifier registered". The boundary must treat an
+        // ENABLED gate on such a format as a configuration error (fail
+        // closed), never as an implicit metadata/allow classification.
+        for format in [
+            RepositoryFormat::Generic,
+            RepositoryFormat::Maven,
+            RepositoryFormat::Go,
+            RepositoryFormat::Nuget,
+            RepositoryFormat::Docker,
+        ] {
+            assert!(
+                classify_download_path(&format, "lodash/-/lodash-4.17.21.tgz").is_none(),
+                "{format:?} must not silently classify download paths"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_dispatches_to_format_specific_classifier() {
+        assert_eq!(
+            classify_download_path(&RepositoryFormat::Npm, "lodash/-/lodash-4.17.21.tgz"),
+            Some(DownloadPathClass::Artifact {
+                package: "lodash".to_string(),
+                version: "4.17.21".to_string(),
+            })
+        );
+        assert_eq!(
+            classify_download_path(&RepositoryFormat::Pypi, "simple/requests"),
+            Some(DownloadPathClass::Metadata)
+        );
+    }
 }

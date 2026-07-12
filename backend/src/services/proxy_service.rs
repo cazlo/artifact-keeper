@@ -2290,6 +2290,60 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Resolve the repository's age-gate policy inputs by id, from the DB, on
+    /// every gated request (#2264).
+    ///
+    /// The boundary twin of `quarantine_service::resolve_config` (#1770): it
+    /// must never trust a caller-supplied `Repository`, because
+    /// `proxy_helpers::with_proxy_repo` synthesizes one via `build_remote_repo`
+    /// with hardcoded `format: Generic` and `age_gate_enabled: false` — a gate
+    /// reading config off that struct silently fails open on exactly the paths
+    /// boundary enforcement exists to cover.
+    ///
+    /// Deliberately unlike quarantine's resolver, failures are errors: a repo
+    /// row that cannot be read must fail the request rather than impersonate
+    /// `enabled = false`, and there is no TTL cache — enabling a gate or
+    /// raising its threshold takes effect on the next request. If a cache is
+    /// ever added it needs write-side invalidation plus enable/threshold-change
+    /// visibility tests first.
+    pub async fn resolve_age_gate_params(
+        &self,
+        repository_id: Uuid,
+    ) -> Result<crate::services::age_gate_service::AgeGateRepoParams> {
+        use sqlx::Row as _;
+
+        let row = sqlx::query(
+            "SELECT key, repo_type, format, age_gate_enabled, age_gate_min_age_days \
+             FROM repositories WHERE id = $1",
+        )
+        .bind(repository_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "Repository {} not found for age-gate resolution",
+                repository_id
+            ))
+        })?;
+
+        Ok(
+            crate::services::age_gate_service::AgeGateRepoParams::from_parts(
+                repository_id,
+                row.try_get::<String, _>("key")
+                    .map_err(|e| AppError::Database(e.to_string()))?,
+                row.try_get::<RepositoryType, _>("repo_type")
+                    .map_err(|e| AppError::Database(e.to_string()))?,
+                row.try_get::<RepositoryFormat, _>("format")
+                    .map_err(|e| AppError::Database(e.to_string()))?,
+                row.try_get::<bool, _>("age_gate_enabled")
+                    .map_err(|e| AppError::Database(e.to_string()))?,
+                row.try_get::<i32, _>("age_gate_min_age_days")
+                    .map_err(|e| AppError::Database(e.to_string()))?,
+            ),
+        )
+    }
+
     /// Fetch artifact from upstream, but use `cache_path` instead of
     /// `fetch_path` when reading and writing the proxy cache.
     ///
@@ -13454,5 +13508,68 @@ mod tests {
             "conditional fetch 401 must enter bearer-exchange flow and surface \
              SSRF rejection as Validation, got {err:?}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2264: boundary age-gate config resolution. The resolver must read the
+    // REAL repo row by id (never the synthesized `build_remote_repo` struct),
+    // reflect enable/threshold changes immediately (no cache), and fail — not
+    // report "disabled" — when the row cannot be found.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_age_gate_params_reads_db_and_sees_changes_immediately_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_string_lossy().as_ref());
+
+        // Fresh repo: migration-146 defaults, real key/type/format from the DB.
+        let params = proxy
+            .resolve_age_gate_params(repo_id)
+            .await
+            .expect("resolve fresh repo");
+        assert_eq!(params.key, key);
+        assert_eq!(params.repo_type, RepositoryType::Remote);
+        assert_eq!(params.format, RepositoryFormat::Npm);
+        assert!(!params.age_gate_enabled);
+        assert_eq!(params.age_gate_min_age_days, 7);
+
+        // Enabling the gate / raising the threshold is visible on the very
+        // next resolution — enforcement, not an optimization (#2264).
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 30 \
+             WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("enable gate");
+        let params = proxy
+            .resolve_age_gate_params(repo_id)
+            .await
+            .expect("resolve updated repo");
+        assert!(params.age_gate_enabled);
+        assert_eq!(params.age_gate_min_age_days, 30);
+
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_age_gate_params_missing_repo_is_an_error_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("ak-2264-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let err = proxy
+            .resolve_age_gate_params(uuid::Uuid::new_v4())
+            .await
+            .expect_err("missing repo must fail the request, never imply disabled");
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
 }
