@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
+use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
 use crate::services::cache_classifier;
 use crate::services::metrics_service::record_proxy_cache_lookup;
 use crate::services::proxy_hydration::{
@@ -2020,6 +2021,26 @@ impl UpstreamClient {
 }
 
 /// Proxy service for fetching and caching artifacts from upstream repositories
+/// What [`ProxyService::enforce_age_gate`] concluded about an allowed request.
+///
+/// The distinction matters to download handlers: a file-download route whose
+/// gated request classifies as `MetadataAllowed` is addressing an index cache
+/// key (e.g. PyPI's PEP 691 `index.v1+json` qualifier) through a route that
+/// must only serve real dist files, and should reject it — preserving the 400
+/// the pre-#2264 handler-layer filename parse raised. The boundary itself
+/// cannot make that call: the same cache path is legitimately fetched by the
+/// index handlers through this very service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgeGateBoundaryOutcome {
+    /// Gate not injected, repo not gated, or format not age-gateable.
+    NotApplicable,
+    /// Path addresses an index/metadata document; the gate never blocks
+    /// those (listing-side filtering is the handlers' concern).
+    MetadataAllowed,
+    /// Path addresses a concrete package version and the policy allows it.
+    ArtifactAllowed,
+}
+
 pub struct ProxyService {
     db: PgPool,
     storage: Arc<StorageService>,
@@ -2050,6 +2071,14 @@ pub struct ProxyService {
     /// //               replaces this field with a wrapping `Coordinator` impl,
     /// //               selected by config via the [`HydrationCoordinator`] enum.
     coordinator: HydrationCoordinator,
+    /// Injected age-gate policy evaluator (#2264). Shared with the handler
+    /// layer's `AppState::age_gate_service` so both see one review pipeline
+    /// and one upstream-metadata cache. Injected post-construction (the
+    /// service is built before the event bus wiring finishes in `main`)
+    /// via [`Self::set_age_gate`]; while unset, [`Self::enforce_age_gate`]
+    /// is a no-op — mirroring the handler layer's behavior when
+    /// `AppState::age_gate_service` is `None`.
+    age_gate: std::sync::OnceLock<Arc<crate::services::age_gate_service::AgeGateService>>,
 }
 
 impl ProxyService {
@@ -2090,7 +2119,16 @@ impl ProxyService {
             cache_persister,
             upstream_client,
             coordinator,
+            age_gate: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Inject the shared [`AgeGateService`] evaluator the proxy boundary
+    /// enforces download age policy with (#2264). Idempotent: the first
+    /// injection wins, later calls are ignored — the service is shared
+    /// process-wide, so "already set" can only mean "set to the same one".
+    pub fn set_age_gate(&self, age_gate: Arc<crate::services::age_gate_service::AgeGateService>) {
+        let _ = self.age_gate.set(age_gate);
     }
 
     /// Fetch artifact from upstream if not cached or cache expired.
@@ -2306,6 +2344,13 @@ impl ProxyService {
     /// raising its threshold takes effect on the next request. If a cache is
     /// ever added it needs write-side invalidation plus enable/threshold-change
     /// visibility tests first.
+    ///
+    /// The returned format is alias-normalized
+    /// ([`AgeGateService::normalize_format`]): the handler layer collapses
+    /// yarn/pnpm onto npm and poetry onto PyPI while string-matching
+    /// `RepoInfo.format`, and the raw DB enum must collapse the same way or a
+    /// gated alias-format repository would fail `is_applicable` here and
+    /// silently serve young versions the handler layer blocks.
     pub async fn resolve_age_gate_params(
         &self,
         repository_id: Uuid,
@@ -2334,14 +2379,152 @@ impl ProxyService {
                     .map_err(|e| AppError::Database(e.to_string()))?,
                 row.try_get::<RepositoryType, _>("repo_type")
                     .map_err(|e| AppError::Database(e.to_string()))?,
-                row.try_get::<RepositoryFormat, _>("format")
-                    .map_err(|e| AppError::Database(e.to_string()))?,
+                AgeGateService::normalize_format(
+                    row.try_get::<RepositoryFormat, _>("format")
+                        .map_err(|e| AppError::Database(e.to_string()))?,
+                ),
                 row.try_get::<bool, _>("age_gate_enabled")
                     .map_err(|e| AppError::Database(e.to_string()))?,
                 row.try_get::<i32, _>("age_gate_min_age_days")
                     .map_err(|e| AppError::Database(e.to_string()))?,
             ),
         )
+    }
+
+    /// Enforce the repository's download age gate at the proxy boundary
+    /// (#2264): every buffered fetch, streaming fetch, streaming cache probe,
+    /// and presign fast path routes through here BEFORE any bytes (or a
+    /// redirect to bytes) can reach the client.
+    ///
+    /// Config is re-resolved from the DB by `repo.id` on every call
+    /// ([`Self::resolve_age_gate_params`]) — never read off the caller's
+    /// `Repository`, which `proxy_helpers::build_remote_repo` synthesizes
+    /// with `age_gate_enabled: false`. Resolution failures fail the request
+    /// (fail closed). The path is classified by the format's registered
+    /// download classifier ([`crate::formats::classify_download_path`]):
+    /// metadata passes, an artifact is checked against the policy, a
+    /// malformed artifact-shaped path is rejected, and an age-gated format
+    /// with no registered classifier is a configuration error — never a
+    /// pass-through.
+    ///
+    /// A blocked version surfaces as [`AppError::AgeGateBlocked`] carrying
+    /// the complete decision (including `last_known_good`), so format
+    /// handlers can intercept for LKG substitution while generic error
+    /// mapping renders the structured 451.
+    pub async fn enforce_age_gate(
+        &self,
+        repo: &Repository,
+        cache_path: &str,
+    ) -> Result<AgeGateBoundaryOutcome> {
+        let Some(age_gate) = self.age_gate.get() else {
+            return Ok(AgeGateBoundaryOutcome::NotApplicable);
+        };
+        let params = self.resolve_age_gate_params(repo.id).await?;
+        if !AgeGateService::is_applicable(&params) {
+            return Ok(AgeGateBoundaryOutcome::NotApplicable);
+        }
+        match crate::formats::classify_download_path(&params.format, cache_path) {
+            None => Err(AppError::Internal(format!(
+                "age gate is enabled for repository '{}' but format {:?} has no \
+                 download-path classifier; failing closed",
+                params.key, params.format
+            ))),
+            Some(crate::formats::DownloadPathClass::Metadata) => {
+                Ok(AgeGateBoundaryOutcome::MetadataAllowed)
+            }
+            Some(crate::formats::DownloadPathClass::InvalidArtifactPath) => {
+                Err(AppError::Validation(format!(
+                    "Invalid artifact path for age-gated repository '{}'",
+                    params.key
+                )))
+            }
+            Some(crate::formats::DownloadPathClass::Artifact { package, version }) => {
+                let published_at = self
+                    .age_gate_publish_time(age_gate, &params, repo, &package, &version)
+                    .await;
+                match age_gate
+                    .check(&params, &package, &version, published_at)
+                    .await?
+                {
+                    AgeGateDecision::Allow => Ok(AgeGateBoundaryOutcome::ArtifactAllowed),
+                    AgeGateDecision::Block {
+                        review_id,
+                        last_known_good,
+                    } => Err(AppError::AgeGateBlocked(Box::new(
+                        crate::error::AgeGateBlockedContext {
+                            review_id,
+                            requested_age_days: published_at
+                                .map(|p| AgeGateService::package_age_days(p, Utc::now())),
+                            package,
+                            version,
+                            min_age_days: params.age_gate_min_age_days,
+                            last_known_good,
+                        },
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Resolve the upstream publish time of one package version for the
+    /// boundary gate, mirroring what the handler-layer gates consulted:
+    ///
+    /// * npm-protocol repos read the packument's `time` map, fetched through
+    ///   this service's own buffered path under the exact cache path the
+    ///   metadata handlers populate (so the common case is a warm-cache read,
+    ///   and the fetch itself re-enters the gate as `MetadataAllowed`);
+    /// * PyPI-protocol repos use the shared [`AgeGateService`] Warehouse
+    ///   JSON cache.
+    ///
+    /// Failures yield `None`, which the age policy treats as "age unknown"
+    /// and blocks (fail closed) — identical to the handler-layer behavior.
+    ///
+    /// Not an `async fn`: the npm arm re-enters
+    /// `fetch_artifact_with_cache_path_and_accept_capped`, whose gate called
+    /// us. The re-entry terminates at runtime (a packument path classifies as
+    /// metadata), but the compiler must be handed a declared —not inferred —
+    /// future type at the recursive edge, or both the future's size and its
+    /// `Send`-ness become unresolvable cycles. Returning a boxed
+    /// `dyn Future + Send` from a plain fn (the `async_recursion` pattern)
+    /// breaks both.
+    fn age_gate_publish_time<'a>(
+        &'a self,
+        age_gate: &'a AgeGateService,
+        params: &'a crate::services::age_gate_service::AgeGateRepoParams,
+        repo: &'a Repository,
+        package: &'a str,
+        version: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<DateTime<Utc>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match params.format {
+                RepositoryFormat::Npm => {
+                    let encoded = crate::formats::npm::encode_package_name_for_upstream(package);
+                    let (content, _) = self
+                        .fetch_artifact_capped(repo, &encoded, LARGE_METADATA_MAX_BYTES)
+                        .await
+                        .ok()?;
+                    let json: serde_json::Value = serde_json::from_slice(&content).ok()?;
+                    crate::services::upstream_metadata::UpstreamMetadataCache::parse_npm_publish_times(
+                        &json,
+                    )
+                    .get(version)
+                    .copied()
+                }
+                RepositoryFormat::Pypi => {
+                    let upstream_url = repo.upstream_url.as_deref()?;
+                    let client = crate::services::upstream_metadata::metadata_http_client().ok()?;
+                    age_gate
+                        .metadata_cache()
+                        .fetch_pypi_publish_times(&client, params.id, upstream_url, package)
+                        .await
+                        .ok()?
+                        .get(version)
+                        .copied()
+                }
+                _ => None,
+            }
+        })
     }
 
     /// Fetch artifact from upstream, but use `cache_path` instead of
@@ -2399,6 +2582,13 @@ impl ProxyService {
         accept: Option<&str>,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
+        // Download age gate (#2264): policy is decided BEFORE the cache read
+        // and before response commitment, so a cache hit cannot bypass it and
+        // a blocked version is never fetched from upstream. Classified on
+        // `cache_path` — the stable, format-canonical identity of what is
+        // being served (`fetch_path` is only the upstream URL tail).
+        self.enforce_age_gate(repo, cache_path).await?;
+
         let upstream_url = Self::remote_target(repo)?;
 
         // Cache keys use the caller-supplied cache_path
@@ -2730,6 +2920,12 @@ impl ProxyService {
         cache_path: &str,
         expected_checksum: Option<String>,
     ) -> Result<StreamingFetchResult> {
+        // Download age gate (#2264): single choke point for the whole
+        // streaming path — the coordinated attempts and the uncoordinated
+        // fallback below both start here, so neither a streaming cache hit
+        // nor a cold upstream stream can serve a blocked version.
+        self.enforce_age_gate(repo, cache_path).await?;
+
         // #1631 layer 2 (#1694): single-flight the cold-cache streaming path so
         // N concurrent requests for the same uncached object open upstream ONCE.
         // The streaming coordinator's followers subscribe to the leader's
@@ -2778,6 +2974,12 @@ impl ProxyService {
         repo: &Repository,
         cache_path: &str,
     ) -> Result<Option<StreamingFetchResult>> {
+        // Download age gate (#2264): the probe serves cached bytes directly,
+        // so it must gate exactly like the full fetch paths. Callers with
+        // best-effort semantics (`proxy_check_cache_streaming`) map the block
+        // to a miss and fall through to a full fetch, which re-raises it.
+        self.enforce_age_gate(repo, cache_path).await?;
+
         let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
         self.try_streaming_cache_hit(repo, cache_path, cache_path, &cache_key, &metadata_key)
@@ -13571,5 +13773,378 @@ mod tests {
             .await
             .expect_err("missing repo must fail the request, never imply disabled");
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2264: boundary age-gate enforcement. Every fetch path routes through
+    // `enforce_age_gate`; these pin the red-team matrix — the caller's
+    // synthesized Repository struct never decides policy, metadata passes,
+    // malformed artifact paths reject, young versions block (including from a
+    // warm cache), missing publish times block, and protocol aliases (yarn)
+    // are gated like the format they speak (npm).
+    // -----------------------------------------------------------------------
+
+    /// Create a gated Remote repo in the DB, a proxy with the evaluator
+    /// injected, and the synthesized stand-in `Repository` callers actually
+    /// pass to the boundary (`build_remote_repo` shape: `Generic` format,
+    /// gate fields at their defaults) — so every test also proves the DB row,
+    /// not the struct, decides policy.
+    async fn gated_proxy_fixture(
+        pool: &PgPool,
+        format: &str,
+        upstream_url: &str,
+        min_age_days: i32,
+    ) -> (Uuid, std::path::PathBuf, Arc<ProxyService>, Repository) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (repo_id, key, dir) = tdh::create_repo(pool, "remote", format).await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = $2 WHERE id = $3",
+        )
+        .bind(upstream_url)
+        .bind(min_age_days)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("configure gated repo");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_string_lossy().as_ref());
+        proxy.set_age_gate(Arc::new(
+            crate::services::age_gate_service::AgeGateService::new(
+                pool.clone(),
+                Arc::new(crate::services::event_bus::EventBus::new(4)),
+            ),
+        ));
+        let mut gate_repo =
+            wiremock_remote_repo(&key, upstream_url, dir.to_string_lossy().as_ref());
+        gate_repo.id = repo_id;
+        (repo_id, dir, proxy, gate_repo)
+    }
+
+    /// Mount a packument for `package` whose `time` map carries one young
+    /// (now) and one aged (400 days) version.
+    async fn mount_npm_packument(upstream: &wiremock::MockServer, package: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let packument = serde_json::json!({
+            "name": package,
+            "time": {
+                "9.9.9": Utc::now().to_rfc3339(),
+                "1.0.0": (Utc::now() - chrono::Duration::days(400)).to_rfc3339(),
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+            .mount(upstream)
+            .await;
+    }
+
+    fn expect_age_gate_block(err: AppError) -> crate::error::AgeGateBlockedContext {
+        match err {
+            AppError::AgeGateBlocked(ctx) => *ctx,
+            other => panic!("expected AgeGateBlocked, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enforce_age_gate_is_noop_without_injected_evaluator_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET age_gate_enabled = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("enable gate");
+        // No set_age_gate: mirrors AppState::age_gate_service == None.
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_string_lossy().as_ref());
+        let mut repo = wiremock_remote_repo(&key, "https://upstream.invalid", "/tmp");
+        repo.id = repo_id;
+        let outcome = proxy
+            .enforce_age_gate(&repo, "lodash/-/lodash-9.9.9.tgz")
+            .await
+            .expect("no evaluator injected must be a no-op");
+        assert_eq!(outcome, AgeGateBoundaryOutcome::NotApplicable);
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn enforce_age_gate_disabled_repo_is_not_applicable_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir, proxy, gate_repo) =
+            gated_proxy_fixture(&pool, "npm", "https://upstream.invalid", 30).await;
+        sqlx::query("UPDATE repositories SET age_gate_enabled = false WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("disable gate");
+        let outcome = proxy
+            .enforce_age_gate(&gate_repo, "lodash/-/lodash-9.9.9.tgz")
+            .await
+            .expect("disabled gate must pass");
+        assert_eq!(outcome, AgeGateBoundaryOutcome::NotApplicable);
+        let _ = std::fs::remove_dir_all(&dir);
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn enforce_age_gate_metadata_passes_and_malformed_rejects_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir, proxy, gate_repo) =
+            gated_proxy_fixture(&pool, "npm", "https://upstream.invalid", 30).await;
+
+        // Packument / index paths pass without any policy evaluation.
+        let outcome = proxy
+            .enforce_age_gate(&gate_repo, "lodash")
+            .await
+            .expect("metadata path must pass");
+        assert_eq!(outcome, AgeGateBoundaryOutcome::MetadataAllowed);
+
+        // Artifact-shaped path with unparseable coordinates: reject, never
+        // metadata, never upstream.
+        let err = proxy
+            .enforce_age_gate(&gate_repo, "lodash/-/lodash-.tgz")
+            .await
+            .expect_err("malformed artifact path must reject");
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+        // Neither call may have minted a review row.
+        let reviews: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM age_gate_reviews WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count reviews");
+        assert_eq!(reviews, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn enforce_age_gate_blocks_young_allows_aged_npm_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        mount_npm_packument(&upstream, "gated-pkg").await;
+        let (repo_id, dir, proxy, gate_repo) =
+            gated_proxy_fixture(&pool, "npm", &upstream.uri(), 30).await;
+
+        let err = proxy
+            .enforce_age_gate(&gate_repo, "gated-pkg/-/gated-pkg-9.9.9.tgz")
+            .await
+            .expect_err("young version must block");
+        let ctx = expect_age_gate_block(err);
+        assert_eq!(ctx.package, "gated-pkg");
+        assert_eq!(ctx.version, "9.9.9");
+        assert_eq!(ctx.min_age_days, 30);
+        assert_eq!(ctx.requested_age_days, Some(0));
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM age_gate_reviews WHERE repository_id = $1 \
+             AND package_name = 'gated-pkg' AND package_version = '9.9.9' \
+             AND status = 'pending'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count reviews");
+        assert_eq!(pending, 1, "block must mint exactly one pending review");
+
+        let outcome = proxy
+            .enforce_age_gate(&gate_repo, "gated-pkg/-/gated-pkg-1.0.0.tgz")
+            .await
+            .expect("aged version must pass");
+        assert_eq!(outcome, AgeGateBoundaryOutcome::ArtifactAllowed);
+        let _ = std::fs::remove_dir_all(&dir);
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn enforce_age_gate_unknown_publish_time_blocks_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // No packument mounted: the publish-time lookup 404s -> age unknown.
+        let upstream = MockServer::start().await;
+        let (repo_id, dir, proxy, gate_repo) =
+            gated_proxy_fixture(&pool, "npm", &upstream.uri(), 30).await;
+        let err = proxy
+            .enforce_age_gate(&gate_repo, "mystery-pkg/-/mystery-pkg-2.0.0.tgz")
+            .await
+            .expect_err("unknown publish time must fail closed");
+        let ctx = expect_age_gate_block(err);
+        assert_eq!(ctx.requested_age_days, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn enforce_age_gate_normalizes_yarn_alias_onto_npm_policy_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        mount_npm_packument(&upstream, "gated-pkg").await;
+        // Format 'yarn' in the DB: the raw enum fails `is_applicable`, so an
+        // unnormalized boundary would silently serve what the handler layer
+        // blocks — the alias fail-open trap this pins shut.
+        let (repo_id, dir, proxy, gate_repo) =
+            gated_proxy_fixture(&pool, "yarn", &upstream.uri(), 30).await;
+        let err = proxy
+            .enforce_age_gate(&gate_repo, "gated-pkg/-/gated-pkg-9.9.9.tgz")
+            .await
+            .expect_err("gated yarn repo must block young versions like npm");
+        let ctx = expect_age_gate_block(err);
+        assert_eq!(ctx.version, "9.9.9");
+        let _ = std::fs::remove_dir_all(&dir);
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn enforce_age_gate_blocks_young_pypi_wheel_and_passes_index_keys_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let warehouse = serde_json::json!({
+            "releases": {
+                "9.9.9": [{"upload_time_iso_8601": Utc::now().to_rfc3339()}],
+                "1.0.0": [{"upload_time_iso_8601":
+                    (Utc::now() - chrono::Duration::days(400)).to_rfc3339()}],
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/pypi/gated-proj/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&warehouse))
+            .mount(&upstream)
+            .await;
+        let (repo_id, dir, proxy, gate_repo) =
+            gated_proxy_fixture(&pool, "pypi", &upstream.uri(), 30).await;
+
+        // Both index cache-key shapes pass as metadata for a gated repo.
+        for index_key in ["simple/gated-proj/", "simple/gated-proj/index.v1+json"] {
+            let outcome = proxy
+                .enforce_age_gate(&gate_repo, index_key)
+                .await
+                .unwrap_or_else(|e| panic!("index key {index_key} must pass: {e:?}"));
+            assert_eq!(outcome, AgeGateBoundaryOutcome::MetadataAllowed);
+        }
+
+        let err = proxy
+            .enforce_age_gate(
+                &gate_repo,
+                "simple/gated-proj/gated_proj-9.9.9-py3-none-any.whl",
+            )
+            .await
+            .expect_err("young wheel must block");
+        let ctx = expect_age_gate_block(err);
+        assert_eq!(ctx.version, "9.9.9");
+        assert_eq!(ctx.requested_age_days, Some(0));
+
+        let outcome = proxy
+            .enforce_age_gate(&gate_repo, "simple/gated-proj/gated_proj-1.0.0.tar.gz")
+            .await
+            .expect("aged sdist must pass");
+        assert_eq!(outcome, AgeGateBoundaryOutcome::ArtifactAllowed);
+        let _ = std::fs::remove_dir_all(&dir);
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn buffered_fetch_blocks_young_gated_artifact_before_upstream_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Only the packument is mounted. Getting AgeGateBlocked (not the 404
+        // an attempted tarball fetch would map to) proves the buffered choke
+        // point gated BEFORE contacting upstream for the artifact.
+        let upstream = MockServer::start().await;
+        mount_npm_packument(&upstream, "gated-pkg").await;
+        let (repo_id, dir, proxy, gate_repo) =
+            gated_proxy_fixture(&pool, "npm", &upstream.uri(), 30).await;
+        let err = proxy
+            .fetch_artifact_capped(&gate_repo, "gated-pkg/-/gated-pkg-9.9.9.tgz", 1024 * 1024)
+            .await
+            .expect_err("buffered fetch of a young version must block");
+        let ctx = expect_age_gate_block(err);
+        assert_eq!(ctx.version, "9.9.9");
+        let _ = std::fs::remove_dir_all(&dir);
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_paths_block_young_gated_artifact_even_on_cache_hit_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        mount_npm_packument(&upstream, "gated-pkg").await;
+        Mock::given(method("GET"))
+            .and(path("/gated-pkg/-/gated-pkg-9.9.9.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\x1f\x8b young" as &[u8]))
+            .mount(&upstream)
+            .await;
+        let (repo_id, dir, proxy, gate_repo) =
+            gated_proxy_fixture(&pool, "npm", &upstream.uri(), 30).await;
+
+        // Warm the cache while the gate is off (entry cached pre-enable).
+        sqlx::query("UPDATE repositories SET age_gate_enabled = false WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("disable gate");
+        let tarball_path = "gated-pkg/-/gated-pkg-9.9.9.tgz";
+        proxy
+            .fetch_artifact_capped(&gate_repo, tarball_path, 1024 * 1024)
+            .await
+            .expect("ungated warm-up fetch succeeds");
+
+        // Re-enable: the warm cache must NOT bypass the gate on either
+        // streaming surface (probe or full fetch).
+        sqlx::query("UPDATE repositories SET age_gate_enabled = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("re-enable gate");
+        let err = match proxy
+            .streaming_cached_artifact_by_path(&gate_repo, tarball_path)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("streaming cache probe must block a young cached version"),
+        };
+        expect_age_gate_block(err);
+        let err = match proxy
+            .fetch_artifact_streaming(&gate_repo, tarball_path)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("streaming fetch must block a young cached version"),
+        };
+        expect_age_gate_block(err);
+        let _ = std::fs::remove_dir_all(&dir);
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::new_v4()).await;
     }
 }

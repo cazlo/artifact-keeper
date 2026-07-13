@@ -1006,11 +1006,13 @@ pub fn build_state_with_proxy_and_age_gate(
     use crate::services::age_gate_service::AgeGateService;
     use crate::services::event_bus::EventBus;
     let mut state = app_state_with(cfg(storage_path), pool.clone(), storage_path);
+    let age_gate = Arc::new(AgeGateService::new(pool, Arc::new(EventBus::new(4))));
+    // Mirror the production wiring (#2264): the proxy boundary enforces the
+    // download age gate with the SAME evaluator the handler layer holds, so
+    // tests built through this constructor exercise boundary enforcement.
+    proxy.set_age_gate(age_gate.clone());
     state.set_proxy_service(proxy);
-    state.set_age_gate_service(Arc::new(AgeGateService::new(
-        pool,
-        Arc::new(EventBus::new(4)),
-    )));
+    state.set_age_gate_service(age_gate);
     Arc::new(state)
 }
 

@@ -251,6 +251,22 @@ impl AgeGateService {
             && matches!(repo.format, RepositoryFormat::Npm | RepositoryFormat::Pypi)
     }
 
+    /// Collapse npm/PyPI ecosystem aliases onto the format whose age-gate
+    /// policy governs them: Yarn and pnpm repositories speak the npm registry
+    /// protocol, Poetry repositories the PyPI one. The handler layer performs
+    /// this mapping while string-matching `RepoInfo.format` (see
+    /// `proxy_helpers::age_gate_params`); the DB-resolved boundary path
+    /// (#2264) gets the raw enum and must apply the same collapse, or a gated
+    /// alias-format repository would fail [`Self::is_applicable`] and silently
+    /// serve young versions the handler layer blocks.
+    pub fn normalize_format(format: RepositoryFormat) -> RepositoryFormat {
+        match format {
+            RepositoryFormat::Yarn | RepositoryFormat::Pnpm => RepositoryFormat::Npm,
+            RepositoryFormat::Poetry => RepositoryFormat::Pypi,
+            other => other,
+        }
+    }
+
     /// Compute package age in whole days from upstream publish time.
     pub fn package_age_days(published_at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
         let delta = now.signed_duration_since(published_at);
@@ -2075,6 +2091,17 @@ mod tests {
             7,
         );
         assert!(!AgeGateService::is_applicable(&local));
+    }
+
+    #[test]
+    fn normalize_format_collapses_registry_protocol_aliases() {
+        use RepositoryFormat as F;
+        assert_eq!(AgeGateService::normalize_format(F::Yarn), F::Npm);
+        assert_eq!(AgeGateService::normalize_format(F::Pnpm), F::Npm);
+        assert_eq!(AgeGateService::normalize_format(F::Poetry), F::Pypi);
+        assert_eq!(AgeGateService::normalize_format(F::Npm), F::Npm);
+        assert_eq!(AgeGateService::normalize_format(F::Pypi), F::Pypi);
+        assert_eq!(AgeGateService::normalize_format(F::Generic), F::Generic);
     }
 
     #[test]

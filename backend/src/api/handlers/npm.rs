@@ -37,12 +37,10 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::RepositoryType;
-use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::age_gate_service::AgeGateService;
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
 };
-use crate::services::upstream_metadata::UpstreamMetadataCache;
-use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -609,21 +607,10 @@ fn map_status(status: StatusCode, msg: &str) -> Response {
     )
 }
 
-/// Encode a package name for use in upstream registry URLs.
-///
-/// Scoped packages like `@openai/codex` must be sent to upstream registries
-/// with the scope separator encoded: `@openai%2Fcodex`. The public npm
-/// registry accepts both forms, but private registries (Nexus, Verdaccio,
-/// GitHub Packages) often require the encoded form. Unscoped packages are
-/// returned unchanged.
-fn encode_package_name_for_upstream(name: &str) -> String {
-    if let Some(rest) = name.strip_prefix('@') {
-        if let Some((scope, pkg)) = rest.split_once('/') {
-            return format!("@{}%2F{}", scope, pkg);
-        }
-    }
-    name.to_string()
-}
+// Moved to `formats::npm` so the proxy-boundary age gate (#2264) can build
+// the same packument cache path the metadata handlers use; re-imported here
+// to keep every existing call site unchanged.
+use crate::formats::npm::encode_package_name_for_upstream;
 
 /// Build the upstream tarball path for a (possibly scoped) package.
 ///
@@ -1848,99 +1835,46 @@ fn build_npm_tarball_upstream_path(package_name: &str, filename: &str) -> String
     build_tarball_upstream_path(package_name, filename)
 }
 
-/// Map an age-gate block decision with LKG into upstream path + filename.
-fn npm_lkg_redirect_from_decision(
-    decision: &AgeGateDecision,
+/// Map a boundary age-gate block (#2264) carrying a last-known-good into the
+/// upstream path + filename of the LKG tarball to substitute.
+fn npm_lkg_redirect_from_block(
+    ctx: &crate::error::AgeGateBlockedContext,
     package_name: &str,
 ) -> Option<(String, String)> {
-    if let AgeGateDecision::Block {
-        last_known_good: Some(lkg),
-        ..
-    } = decision
-    {
-        let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
-        let lkg_path = build_npm_tarball_upstream_path(package_name, &lkg_filename);
-        Some((lkg_path, lkg_filename))
-    } else {
-        None
-    }
+    let lkg = ctx.last_known_good.as_ref()?;
+    let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
+    let lkg_path = build_npm_tarball_upstream_path(package_name, &lkg_filename);
+    Some((lkg_path, lkg_filename))
 }
 
-async fn npm_publish_time_for_version(
-    state: &SharedState,
-    repo: &RepoInfo,
-    package_name: &str,
-    version: &str,
-) -> Option<chrono::DateTime<Utc>> {
-    if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
-        let encoded_name = encode_package_name_for_upstream(package_name);
-        // Capped like every other buffered packument read (#2181): this runs
-        // on the tarball download path, where an unbounded upstream metadata
-        // body must not be able to balloon memory.
-        if let Ok((content, _)) = proxy_helpers::proxy_fetch_capped(
-            proxy,
-            repo.id,
-            &repo.key,
-            upstream_url,
-            &encoded_name,
-            proxy_helpers::LARGE_METADATA_MAX_BYTES,
-        )
-        .await
-        {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
-                let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
-                return times.get(version).copied();
-            }
-        }
-    }
-    None
-}
-
+/// Pre-fetch age-gate probe for the npm tarball download paths (#2264).
+///
+/// Enforcement lives at the proxy boundary (`ProxyService::enforce_age_gate`
+/// gates every fetch this handler could make); this probe exists so the
+/// handler can intercept the typed block BEFORE the fetch and substitute the
+/// last-known-good tarball — a format-specific serve decision the boundary
+/// cannot make. `Ok(None)` means proceed with the requested tarball,
+/// `Ok(Some((path, filename)))` means serve the LKG instead, and a block
+/// without an LKG surfaces the structured 451 via `Err`.
 async fn apply_npm_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
     package_name: &str,
     filename: &str,
 ) -> Result<Option<(String, String)>, Response> {
-    let svc = match state.age_gate_service.as_ref() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
+    let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) else {
         return Ok(None);
-    }
-
-    let short_name = npm_tarball_short_name(package_name);
-    let version =
-        crate::formats::npm::NpmHandler::extract_version_from_filename(filename, short_name)
-            .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
-
-    let published_at = npm_publish_time_for_version(state, repo, package_name, &version).await;
-    let decision = svc
-        .check(&params, package_name, &version, published_at)
-        .await
-        .map_err(|e| e.into_response())?;
-    match decision {
-        AgeGateDecision::Allow => Ok(None),
-        AgeGateDecision::Block {
-            review_id: _,
-            last_known_good: Some(_),
-        } => Ok(npm_lkg_redirect_from_decision(&decision, package_name)),
-        AgeGateDecision::Block {
-            review_id,
-            last_known_good: None,
-        } => {
-            let requested_age_days =
-                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
-            Err(proxy_helpers::age_gate_blocked_response(
-                review_id,
-                package_name,
-                &version,
-                repo.age_gate_min_age_days,
-                requested_age_days,
-            ))
-        }
+    };
+    let upstream_path = build_tarball_upstream_path(package_name, filename);
+    let gate_repo = proxy_helpers::build_remote_repo(repo.id, &repo.key, upstream_url);
+    match proxy.enforce_age_gate(&gate_repo, &upstream_path).await {
+        Ok(_) => Ok(None),
+        Err(AppError::AgeGateBlocked(ctx)) => match npm_lkg_redirect_from_block(&ctx, package_name)
+        {
+            Some(redirect) => Ok(Some(redirect)),
+            None => Err(AppError::AgeGateBlocked(ctx).into_response()),
+        },
+        Err(e) => Err(e.into_response()),
     }
 }
 
@@ -2236,16 +2170,16 @@ async fn serve_tarball(
             state.proxy_service.as_deref()
         };
 
-        // #2066: enforce each gated Remote member's download age gate before
-        // resolving the virtual tarball. Virtual metadata is already filtered
-        // per-member (see the metadata branch), so an ordinary `npm install`
-        // cannot resolve a young version — but a client that already knows the
-        // exact young tarball URL (a pinned lockfile) would otherwise stream it
-        // straight through `resolve_virtual_download`. Only runs when the name
-        // is not locally owned (`proxy_for_virtual` is `Some`); a locally-owned
-        // name is served from the local member and is never age-gated. The
-        // shared `resolve_virtual_download` helper is left untouched so no
-        // other format (maven/hex/...) is affected.
+        // #2066/#2264: probe each gated Remote member's download age gate
+        // before resolving the virtual tarball so a withheld young version can
+        // be substituted with that member's last-known-good — a per-member
+        // serve decision the shared resolver cannot make. Enforcement itself
+        // no longer lives here: the proxy boundary gates every member fetch
+        // `resolve_virtual_download` performs, and its policy-aware
+        // classifiers keep a blocked member terminal instead of falling
+        // through to a lower-priority member. Only runs when the name is not
+        // locally owned (`proxy_for_virtual` is `Some`); a locally-owned name
+        // is served from the local member and is never age-gated.
         if let Some(proxy) = proxy_for_virtual {
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
             for member in &members {
@@ -4592,18 +4526,28 @@ mod tests {
         assert_eq!(npm_tarball_short_name("express"), "express");
     }
 
+    fn blocked_ctx(
+        last_known_good: Option<crate::services::age_gate_service::LastKnownGood>,
+    ) -> crate::error::AgeGateBlockedContext {
+        crate::error::AgeGateBlockedContext {
+            review_id: uuid::Uuid::new_v4(),
+            package: "pkg".to_string(),
+            version: "9.9.9".to_string(),
+            min_age_days: 30,
+            requested_age_days: Some(0),
+            last_known_good,
+        }
+    }
+
     #[test]
     fn test_npm_lkg_redirect_uses_literal_slash_path() {
         use crate::services::age_gate_service::LastKnownGood;
 
-        let decision = AgeGateDecision::Block {
-            review_id: uuid::Uuid::new_v4(),
-            last_known_good: Some(LastKnownGood {
-                version: "16.0.0".to_string(),
-                artifact_path: "ignored".to_string(),
-            }),
-        };
-        let (path, filename) = npm_lkg_redirect_from_decision(&decision, "@angular/core").unwrap();
+        let ctx = blocked_ctx(Some(LastKnownGood {
+            version: "16.0.0".to_string(),
+            artifact_path: "ignored".to_string(),
+        }));
+        let (path, filename) = npm_lkg_redirect_from_block(&ctx, "@angular/core").unwrap();
         assert_eq!(filename, "core-16.0.0.tgz");
         assert_eq!(path, "@angular/core/-/core-16.0.0.tgz");
         assert!(!path.contains("%2F"));
@@ -4611,13 +4555,8 @@ mod tests {
 
     #[test]
     fn test_npm_lkg_redirect_none_without_last_known_good() {
-        // Allow and Block-without-LKG decisions produce no redirect target.
-        assert!(npm_lkg_redirect_from_decision(&AgeGateDecision::Allow, "express").is_none());
-        let blocked_no_lkg = AgeGateDecision::Block {
-            review_id: uuid::Uuid::new_v4(),
-            last_known_good: None,
-        };
-        assert!(npm_lkg_redirect_from_decision(&blocked_no_lkg, "express").is_none());
+        // A block without an LKG produces no redirect target (surfaces 451).
+        assert!(npm_lkg_redirect_from_block(&blocked_ctx(None), "express").is_none());
     }
 
     #[test]

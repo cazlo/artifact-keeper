@@ -641,10 +641,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     app_state.set_metrics_handle(metrics_handle);
 
+    let age_gate_service = Arc::new(
+        artifact_keeper_backend::services::age_gate_service::AgeGateService::new(
+            db_pool.clone(),
+            app_state.event_bus.clone(),
+        ),
+    );
+
     // Initialize proxy service for remote repository caching
     match StorageService::from_config(&config).await {
         Ok(storage_svc) => {
             let proxy_service = Arc::new(ProxyService::new(db_pool.clone(), Arc::new(storage_svc)));
+            // #2264: the proxy boundary enforces the download age gate with
+            // the same evaluator the handler layer holds.
+            proxy_service.set_age_gate(age_gate_service.clone());
             app_state.set_proxy_service(proxy_service);
             tracing::info!("Proxy service initialized for remote repositories");
         }
@@ -656,12 +666,6 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
-    let age_gate_service = Arc::new(
-        artifact_keeper_backend::services::age_gate_service::AgeGateService::new(
-            db_pool.clone(),
-            app_state.event_bus.clone(),
-        ),
-    );
     app_state.set_age_gate_service(age_gate_service);
 
     // Initialize SMTP service (optional, graceful no-op when SMTP_HOST is absent)

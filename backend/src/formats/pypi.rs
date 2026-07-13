@@ -605,11 +605,21 @@ fn html_escape_pep503(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Cache-key suffix the pypi handler appends to a project's simple-index
+/// path to keep the PEP 691 JSON representation from colliding with the HTML
+/// one (see `simple_project` in the handler). It occupies the filename
+/// position of an artifact-shaped cache path but names an index document, so
+/// the download classifier below must recognize it as metadata or the proxy
+/// boundary would reject every gated repo's JSON index fetch.
+pub const PEP691_INDEX_CACHE_SUFFIX: &str = "index.v1+json";
+
 /// Classify a PyPI proxy-cache path for the download age gate (#2264).
 ///
 /// PyPI download cache paths are `simple/{project}/{filename}` (see
-/// `build_pypi_proxy_cache_path` in the handler); the two-segment
-/// `simple/{project}` form is the simple-index document itself. A PEP 658
+/// `build_pypi_proxy_cache_path` in the handler). Index documents in the same
+/// namespace are the two-segment `simple/{project}` form, the trailing-slash
+/// `simple/{project}/` form the proxied HTML index is cached under, and the
+/// [`PEP691_INDEX_CACHE_SUFFIX`]-qualified JSON twin. A PEP 658
 /// `{filename}.metadata` sidecar is version-addressed and classifies with its
 /// artifact, matching the handler-layer gate's parsing today. Deeper paths
 /// under `simple/` are artifact-shaped but non-canonical — reject rather than
@@ -620,8 +630,17 @@ pub fn classify_download_path(cache_path: &str) -> crate::formats::DownloadPathC
     let mut parts = cache_path.split('/');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some("simple"), Some(project), Some(filename), None) => {
-            if project.is_empty() || filename.is_empty() {
+            if project.is_empty() {
                 return DownloadPathClass::InvalidArtifactPath;
+            }
+            // `simple/{project}/` is the cache key of the proxied HTML index
+            // and `simple/{project}/index.v1+json` of its PEP 691 JSON twin:
+            // both are index documents, not artifact downloads. The download
+            // route's own strictness (a gated file request must classify as
+            // an artifact) lives in the handler, which knows request intent;
+            // the classifier only describes what the cache path addresses.
+            if filename.is_empty() || filename == PEP691_INDEX_CACHE_SUFFIX {
+                return DownloadPathClass::Metadata;
             }
             match PypiHandler::version_from_filename(filename) {
                 Some(version) => DownloadPathClass::Artifact {
@@ -835,6 +854,16 @@ mod tests {
             classify_download_path("simple/requests"),
             DownloadPathClass::Metadata
         );
+        // The proxied HTML index is cached under the trailing-slash form.
+        assert_eq!(
+            classify_download_path("simple/requests/"),
+            DownloadPathClass::Metadata
+        );
+        // The PEP 691 JSON index twin is cached under a qualified filename.
+        assert_eq!(
+            classify_download_path("simple/requests/index.v1+json"),
+            DownloadPathClass::Metadata
+        );
         // Root index and non-simple cache keys are index documents.
         assert_eq!(
             classify_download_path("simple"),
@@ -889,13 +918,9 @@ mod tests {
             classify_download_path("simple/requests/sub/requests-2.31.0.tar.gz"),
             DownloadPathClass::InvalidArtifactPath
         );
-        // Empty segments around the download position.
+        // Empty project segment around the download position.
         assert_eq!(
             classify_download_path("simple//requests-2.31.0.tar.gz"),
-            DownloadPathClass::InvalidArtifactPath
-        );
-        assert_eq!(
-            classify_download_path("simple/requests/"),
             DownloadPathClass::InvalidArtifactPath
         );
     }

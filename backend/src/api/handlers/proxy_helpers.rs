@@ -376,6 +376,19 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
             );
             (StatusCode::FORBIDDEN, msg.clone()).into_response()
         }
+        // Age-gate block from the proxy boundary (#2264): a deliberate policy
+        // outcome, not an upstream failure. Its `IntoResponse` impl renders
+        // the structured 451 body clients and tests contract on; folding it
+        // into the 502 catch-all would both mask the policy and lose the body.
+        crate::error::AppError::AgeGateBlocked(_) => {
+            tracing::info!(
+                repo_key = %repo_key,
+                path = %diagnostic_path,
+                "Proxy download withheld by age-gate policy: {}",
+                e
+            );
+            e.into_response()
+        }
         _ => {
             tracing::warn!(
                 repo_key = %repo_key,
@@ -663,6 +676,13 @@ async fn try_member_cache_redirect(
     {
         return None;
     }
+    // Download age gate (#2264): a fresh cached young version must not be
+    // presigned either. Falling through (rather than erroring) routes the
+    // request onto the streaming member fetch, whose boundary gate re-raises
+    // the block so it surfaces through the policy-aware classifiers.
+    if proxy.enforce_age_gate(member, path).await.is_err() {
+        return None;
+    }
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     try_proxy_cache_redirect(
         storage.as_ref(),
@@ -793,6 +813,16 @@ pub async fn proxy_fetch_or_redirect(
             // a 302 on redirect-capable backends. Gate BEFORE signing; a hold
             // surfaces as the same 409/403 (no redirect, no upstream refetch).
             if let Err(e) = proxy_service.cache_quarantine_gate(repo_key, path).await {
+                return Err(map_proxy_error(repo_key, path, e));
+            }
+            // Download age gate (#2264): same reasoning as the quarantine
+            // gate above — the presign fast path skips the buffered/streaming
+            // fetch paths that enforce the gate, so it must gate before
+            // signing or a fresh cached young version would be handed out as
+            // a 302. Surfaces the structured 451 (or 400 for a malformed
+            // artifact path) with no redirect and no upstream refetch.
+            let gate_repo = build_remote_repo(repo_id, repo_key, upstream_url);
+            if let Err(e) = proxy_service.enforce_age_gate(&gate_repo, path).await {
                 return Err(map_proxy_error(repo_key, path, e));
             }
             // proxy-cache content is stored without the global key prefix,
@@ -1632,16 +1662,17 @@ pub(crate) fn classify_cache_probe<T>(
     match probe {
         Ok(Some(hit)) => (MemberCacheClass::DefiniteHit, Some(hit)),
         Ok(None) => (MemberCacheClass::NeedsUpstream, None),
-        // A quarantine block must surface (#1770): re-resolve in Pass 2.
-        Err(e) if is_quarantine_block(&e) => (MemberCacheClass::NeedsUpstream, None),
+        // A policy block (quarantine #1770, age gate #2264) must surface:
+        // re-resolve in Pass 2.
+        Err(e) if is_policy_block(&e) => (MemberCacheClass::NeedsUpstream, None),
         Err(_) => (MemberCacheClass::DefiniteMiss, None),
     }
 }
 
 /// Map a Remote member's buffered/streaming upstream fetch result to its final
-/// [`MemberResolveOutcome`] (#2069). A Package-Age-Policy quarantine block
-/// (#1770) surfaces as [`MemberResolveOutcome::Quarantine`]; any other error is
-/// an ordinary miss.
+/// [`MemberResolveOutcome`] (#2069). A policy block — quarantine (#1770) or
+/// age gate (#2264) — surfaces as [`MemberResolveOutcome::Quarantine`]; any
+/// other error is an ordinary miss.
 pub(crate) fn classify_stream_upstream(
     result: Result<StreamingFetchResult, crate::error::AppError>,
     member_key: &str,
@@ -1649,7 +1680,7 @@ pub(crate) fn classify_stream_upstream(
 ) -> MemberResolveOutcome<StreamingFetchResult, Response> {
     match result {
         Ok(result) => MemberResolveOutcome::Hit(result),
-        Err(e) if is_quarantine_block(&e) => {
+        Err(e) if is_policy_block(&e) => {
             MemberResolveOutcome::Quarantine(map_proxy_error(member_key, path, e))
         }
         Err(_) => MemberResolveOutcome::Miss,
@@ -1678,8 +1709,9 @@ pub(crate) fn classify_streaming_cache_probe(
             Err(_) => (MemberCacheClass::NeedsUpstream, None),
         },
         Ok(None) => (MemberCacheClass::NeedsUpstream, None),
-        // A quarantine block must surface (#1770): re-resolve in Pass 2.
-        Err(e) if is_quarantine_block(&e) => (MemberCacheClass::NeedsUpstream, None),
+        // A policy block (quarantine #1770, age gate #2264) must surface:
+        // re-resolve in Pass 2.
+        Err(e) if is_policy_block(&e) => (MemberCacheClass::NeedsUpstream, None),
         Err(_) => (MemberCacheClass::DefiniteMiss, None),
     }
 }
@@ -1710,13 +1742,14 @@ pub(crate) fn classify_streaming_local(
 
 /// Map a Remote member's streaming upstream fetch (already mapped to a
 /// [`Response`] by [`proxy_fetch_streaming_member`]) to its final outcome
-/// (#2069). A quarantine 409/403 surfaces; any other error Response is a miss.
+/// (#2069). A quarantine 409/403 or age-gate 451 (#2264) surfaces; any other
+/// error Response is a miss.
 pub(crate) fn classify_streaming_upstream(
     result: Result<Response, Response>,
 ) -> MemberResolveOutcome<Response, Response> {
     match result {
         Ok(response) => MemberResolveOutcome::Hit(response),
-        Err(resp) if is_quarantine_block_response(&resp) => MemberResolveOutcome::Quarantine(resp),
+        Err(resp) if is_policy_block_response(&resp) => MemberResolveOutcome::Quarantine(resp),
         Err(_) => MemberResolveOutcome::Miss,
     }
 }
@@ -1875,6 +1908,15 @@ fn is_quarantine_block(e: &crate::error::AppError) -> bool {
     )
 }
 
+/// A member fetch error that is a deliberate policy outcome — quarantine
+/// hold/rejection (#1770) or an age-gate block (#2264) — rather than an
+/// ordinary miss. Policy outcomes must surface from virtual-repo resolution;
+/// classifying them as misses would let priority fallthrough serve the same
+/// artifact from a lower-priority member, turning the policy into a bypass.
+fn is_policy_block(e: &crate::error::AppError) -> bool {
+    is_quarantine_block(e) || matches!(e, crate::error::AppError::AgeGateBlocked(_))
+}
+
 /// `Response`-level sibling of [`is_quarantine_block`] for the streaming
 /// virtual-download path, where the member fetch has already mapped its
 /// [`AppError`] to a [`Response`] (#1770). A 409 Conflict (held) or 403
@@ -1882,6 +1924,13 @@ fn is_quarantine_block(e: &crate::error::AppError) -> bool {
 /// virtual-repo resolution rather than fall through to the next member.
 fn is_quarantine_block_response(resp: &Response) -> bool {
     matches!(resp.status(), StatusCode::CONFLICT | StatusCode::FORBIDDEN)
+}
+
+/// `Response`-level sibling of [`is_policy_block`]: 409/403 are the
+/// quarantine statuses, 451 is the age-gate block (#2264). 451 is emitted
+/// only by the age-gate rendering paths, so matching on status is exact.
+fn is_policy_block_response(resp: &Response) -> bool {
+    is_quarantine_block_response(resp) || resp.status() == StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
 }
 
 /// Streaming sibling of [`resolve_virtual_download`] that avoids
@@ -4272,6 +4321,68 @@ mod tests {
             "upstream".into()
         )));
         assert!(!is_quarantine_block(&AppError::Storage("io".into())));
+    }
+
+    // ── Age-gate policy blocks are terminal in virtual resolution (#2264) ──
+
+    fn age_gate_blocked_err() -> crate::error::AppError {
+        crate::error::AppError::AgeGateBlocked(Box::new(crate::error::AgeGateBlockedContext {
+            review_id: Uuid::new_v4(),
+            package: "gated-pkg".to_string(),
+            version: "9.9.9".to_string(),
+            min_age_days: 30,
+            requested_age_days: Some(0),
+            last_known_good: None,
+        }))
+    }
+
+    #[test]
+    fn test_is_policy_block_covers_quarantine_and_age_gate() {
+        use crate::error::AppError;
+        assert!(is_policy_block(&AppError::Conflict("held".into())));
+        assert!(is_policy_block(&AppError::Authorization("rejected".into())));
+        assert!(is_policy_block(&age_gate_blocked_err()));
+        assert!(!is_policy_block(&AppError::NotFound("gone".into())));
+        assert!(!is_policy_block(&AppError::BadGateway("upstream".into())));
+    }
+
+    #[test]
+    fn test_is_policy_block_response_includes_451() {
+        let blocked = age_gate_blocked_err().into_response();
+        assert_eq!(
+            blocked.status(),
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            "AgeGateBlocked must render as 451"
+        );
+        assert!(is_policy_block_response(&blocked));
+        let miss = (StatusCode::NOT_FOUND, "gone").into_response();
+        assert!(!is_policy_block_response(&miss));
+    }
+
+    #[test]
+    fn test_classify_stream_upstream_age_gate_block_is_terminal() {
+        // A member whose fetch is age-gate blocked must surface (Quarantine
+        // outcome, rendered 451), never classify as a miss that lets a
+        // lower-priority member serve the same young version.
+        match classify_stream_upstream(
+            Err(age_gate_blocked_err()),
+            "member-a",
+            "gated-pkg/-/gated-pkg-9.9.9.tgz",
+        ) {
+            MemberResolveOutcome::Quarantine(resp) => {
+                assert_eq!(resp.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+            }
+            _ => panic!("expected terminal policy outcome"),
+        }
+    }
+
+    #[test]
+    fn test_classify_cache_probe_age_gate_block_reresolves_upstream() {
+        // Pass-1 cache probe: a policy block defers to Pass 2 (NeedsUpstream)
+        // where the fetch re-raises and surfaces it — never DefiniteMiss.
+        let (class, hit) = classify_cache_probe::<()>(Err(age_gate_blocked_err()));
+        assert_eq!(class, MemberCacheClass::NeedsUpstream);
+        assert!(hit.is_none());
     }
 
     // ── Two-phase virtual fan-out: priority-preserving decision logic ──

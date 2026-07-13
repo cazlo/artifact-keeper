@@ -35,9 +35,8 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::RepositoryType;
-use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::age_gate_service::AgeGateService;
 use crate::services::upstream_metadata::metadata_http_client;
-use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1361,71 +1360,16 @@ async fn filter_pypi_simple_html_response(
     }
 }
 
-async fn apply_pypi_download_age_gate(
-    state: &SharedState,
-    repo: &RepoInfo,
-    project: &str,
-    filename: &str,
-) -> Result<Option<String>, Response> {
-    let svc = match state.age_gate_service.as_ref() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
-        return Ok(None);
-    }
-
-    let info = PypiHandler::parse_filename(filename)
-        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
-    let version = info.version.ok_or_else(|| {
-        AppError::Validation("Missing version in filename".to_string()).into_response()
-    })?;
-
-    let published_at =
-        if let (Some(upstream_url), Ok(client)) = (&repo.upstream_url, metadata_http_client()) {
-            svc.metadata_cache()
-                .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
-                .await
-                .ok()
-                .and_then(|times| times.get(&version).copied())
-        } else {
-            None
-        };
-
-    match svc
-        .check(&params, project, &version, published_at)
-        .await
-        .map_err(|e| e.into_response())?
-    {
-        AgeGateDecision::Allow => Ok(None),
-        AgeGateDecision::Block {
-            review_id: _,
-            last_known_good: Some(lkg),
-        } => Ok(Some(pypi_lkg_filename_from_artifact_path(
-            &lkg.artifact_path,
-        ))),
-        AgeGateDecision::Block {
-            review_id,
-            last_known_good: None,
-        } => {
-            let requested_age_days =
-                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
-            Err(proxy_helpers::age_gate_blocked_response(
-                review_id,
-                project,
-                &version,
-                repo.age_gate_min_age_days,
-                requested_age_days,
-            ))
-        }
-    }
-}
-
 /// Run the remote-PyPI download age gate and, when the requested version is
 /// withheld, resolve the response the caller should return: the last-known-good
 /// wheel served via the proxy cache (presigned redirect / cache stream /
 /// upstream refetch), or the 451 block propagated as an `Err`.
+///
+/// Enforcement lives at the proxy boundary (#2264,
+/// `ProxyService::enforce_age_gate` gates every fetch below); this pre-fetch
+/// probe exists so the handler can substitute the last-known-good wheel — a
+/// format-specific serve decision the boundary cannot make — before any
+/// fetch of the withheld version is attempted.
 ///
 /// Returns `Ok(Some(response))` when the gate handled the request and
 /// `Ok(None)` when the version is allowed and the caller should keep serving
@@ -1444,17 +1388,46 @@ async fn enforce_pypi_download_age_gate(
         _ => return Ok(None),
     };
 
-    let lkg_filename = match apply_pypi_download_age_gate(state, repo, project, filename).await? {
-        Some(lkg) => lkg,
-        None => return Ok(None),
-    };
-
     let normalized = PypiHandler::normalize_name(project);
+    let requested_cache_path = build_pypi_proxy_cache_path(&normalized, filename);
+    let gate_repo = proxy_helpers::build_remote_repo(repo.id, repo_key, upstream_url);
+    let lkg_filename = match proxy
+        .enforce_age_gate(&gate_repo, &requested_cache_path)
+        .await
+    {
+        Ok(outcome) => {
+            // This route serves dist files. When the gate is active, a
+            // filename whose cache path classifies as an index document
+            // (e.g. the PEP 691 `index.v1+json` qualifier) must stay the 400
+            // the pre-#2264 filename parse raised here — never a download of
+            // raw cached index bytes, which would disclose the young
+            // versions the filtered listings withhold.
+            if outcome == crate::services::proxy_service::AgeGateBoundaryOutcome::MetadataAllowed {
+                return Err(
+                    AppError::Validation("Missing version in filename".to_string()).into_response(),
+                );
+            }
+            return Ok(None);
+        }
+        Err(AppError::AgeGateBlocked(ctx)) => match ctx.last_known_good {
+            Some(ref lkg) => pypi_lkg_filename_from_artifact_path(&lkg.artifact_path),
+            None => return Err(AppError::AgeGateBlocked(ctx).into_response()),
+        },
+        Err(e) => return Err(e.into_response()),
+    };
     let lkg_cache_path = build_pypi_proxy_cache_path(&normalized, &lkg_filename);
     // #1555 ordering holds on the LKG fallback too: presigned redirect on a
     // fresh cache hit BEFORE the streaming cache check, so a cached LKG wheel is
     // not streamed through the backend.
-    if let Some(redirect) = pypi_proxy_cache_redirect(state, proxy, repo_key, &lkg_cache_path).await
+    if let Some(redirect) = pypi_proxy_cache_redirect(
+        state,
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        &lkg_cache_path,
+    )
+    .await
     {
         return Ok(Some(redirect));
     }
@@ -1539,8 +1512,15 @@ async fn serve_file(
 
                     // #1555: redirect to a presigned URL on a fresh cache hit
                     // before falling back to streaming.
-                    if let Some(redirect) =
-                        pypi_proxy_cache_redirect(state, proxy, repo_key, &local_cache_path).await
+                    if let Some(redirect) = pypi_proxy_cache_redirect(
+                        state,
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        &local_cache_path,
+                    )
+                    .await
                     {
                         return Ok(redirect);
                     }
@@ -1723,7 +1703,9 @@ async fn serve_file(
                             if let Some(redirect) = pypi_proxy_cache_redirect(
                                 state,
                                 proxy,
+                                member.id,
                                 &member.key,
+                                upstream_url,
                                 &local_cache_path,
                             )
                             .await
@@ -2122,7 +2104,9 @@ async fn resolve_pypi_remote_fetch_target(
 async fn pypi_proxy_cache_redirect(
     state: &SharedState,
     proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
     repo_key: &str,
+    upstream_url: &str,
     cache_path: &str,
 ) -> Option<Response> {
     if !state.config.presigned_downloads_enabled {
@@ -2137,6 +2121,18 @@ async fn pypi_proxy_cache_redirect(
         return None;
     }
     if !proxy.is_cache_fresh(repo_key, cache_path).await {
+        return None;
+    }
+    // Download age gate (#2264): a fresh cached young version must not be
+    // presigned. Falling through (rather than erroring) routes the request
+    // onto the streaming/upstream paths, whose boundary gate re-raises the
+    // block with the structured 451.
+    let gate_repo = proxy_helpers::build_remote_repo(repo_id, repo_key, upstream_url);
+    if proxy
+        .enforce_age_gate(&gate_repo, cache_path)
+        .await
+        .is_err()
+    {
         return None;
     }
     let cache_key =
@@ -2937,6 +2933,7 @@ fn merge_local_into_remote_simple_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use sha2::{Digest, Sha256};
 
     fn headers_with_replication(value: &str) -> HeaderMap {
@@ -4959,12 +4956,24 @@ mod tests {
         let state =
             tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
 
-        // Remote repo with the age gate ENABLED and an absurd threshold so any
-        // recent release is "young".
+        // Remote repo with the age gate ENABLED at the maximum threshold the
+        // migration-146 CHECK allows (3650 days), so a just-published release
+        // is "young". Enabled on the DB row: boundary enforcement (#2264)
+        // resolves config by repo id, never from the caller-supplied struct
+        // (the struct fields are kept in sync for the handler-layer listing
+        // filters).
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, \
+             age_gate_min_age_days = 3650 WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable gate on the repo row");
         let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
         repo_info.format = "pypi".to_string();
         repo_info.age_gate_enabled = true;
-        repo_info.age_gate_min_age_days = 36_500; // 100 years
+        repo_info.age_gate_min_age_days = 3650; // 10 years
 
         // Seed the local `artifacts` row + payload that would otherwise be
         // served straight from storage on the cache-hit branch.
@@ -7121,7 +7130,9 @@ mod tests {
         let result = super::pypi_proxy_cache_redirect(
             &state,
             proxy.as_ref(),
+            uuid::Uuid::new_v4(),
             "pypi-remote",
+            "https://upstream.invalid/simple",
             "simple/foo/foo-1.0-py3-none-any.whl",
         )
         .await;
@@ -7149,7 +7160,9 @@ mod tests {
         let result = super::pypi_proxy_cache_redirect(
             &state,
             proxy.as_ref(),
+            uuid::Uuid::new_v4(),
             "pypi-remote",
+            "https://upstream.invalid/simple",
             "simple/foo/foo-1.0-py3-none-any.whl",
         )
         .await;

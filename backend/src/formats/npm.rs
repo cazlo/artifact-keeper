@@ -155,6 +155,26 @@ impl NpmHandler {
     }
 }
 
+/// Encode a package name for use in upstream registry URLs.
+///
+/// Scoped packages like `@openai/codex` must be sent to upstream registries
+/// with the scope separator encoded: `@openai%2Fcodex`. The public npm
+/// registry accepts both forms, but private registries (Nexus, Verdaccio,
+/// GitHub Packages) often require the encoded form. Unscoped packages are
+/// returned unchanged.
+///
+/// Lives here (rather than the npm handler that historically owned it) so the
+/// proxy-boundary age gate (#2264) builds its packument publish-time lookup
+/// on exactly the cache path the metadata handlers populate.
+pub fn encode_package_name_for_upstream(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('@') {
+        if let Some((scope, pkg)) = rest.split_once('/') {
+            return format!("@{}%2F{}", scope, pkg);
+        }
+    }
+    name.to_string()
+}
+
 /// Classify an npm proxy-cache path for the download age gate (#2264).
 ///
 /// npm tarball cache paths take the canonical shape
